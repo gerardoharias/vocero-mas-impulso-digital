@@ -119,6 +119,27 @@ export function aiMockCompletion(messages: InMessage[]): string {
     });
   }
 
+  // Incidente 2026-09-19 — el dueño canceló una cita desde la pantalla de
+  // Citas y, al siguiente mensaje, el agente se la recordó igual: no tenía
+  // ningún dato de citas en su contexto y repetía su propio "te agendé" del
+  // historial. Este marcador hace que el mock hable de la cita ÚNICAMENTE a
+  // partir del bloque ESTADO DE AGENDA del system prompt — o sea, ejercita
+  // justo la pieza que faltaba: si el bloque no llega, el self-test lo ve.
+  //
+  // Va antes de las ramas de agenda porque /\bcita\b/ también casaría con
+  // "estado-cita:". Y el formato que parsea es el literal de prompts.ts: si
+  // alguien lo cambia, el control positivo del self-test se pone rojo en vez
+  // de pasar vacío.
+  if (/^estado-cita:/i.test(lastUser)) {
+    const vigente = system.match(/Citas vigentes:\n- (.+?) → startUtc:/);
+    return JSON.stringify({
+      action: "reply",
+      text: vigente
+        ? `Te recuerdo que tienes tu cita el ${vigente[1]}.`
+        : "No tienes ninguna cita vigente conmigo.",
+    });
+  }
+
   // Auditoría 2026-09-17 — pedir MOVER una cita existente nunca debe caer en
   // el camino de offer_slots/book_slot (ambos coinciden con "cita"/"agendar"
   // más abajo): se revisa primero y determinista.

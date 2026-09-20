@@ -111,3 +111,29 @@ mismo evento: **nunca** crea uno duplicado en el calendario del dueño.
 2. Con un conector externo activo, el estado del mock queda **vacío**: el
    proveedor jamás se entera de una cita de prueba. Se verifica por ausencia, y
    vale igual para crear, reprogramar y cancelar.
+
+## US-cancelada — una cita cancelada deja de existir para el agente
+
+Incidente del 2026-09-19: el dueño agendó una demo con el agente, la canceló
+desde la pantalla de Citas, y al volver a escribir el agente respondió *"Te
+recuerdo que tienes tu demostración agendada para el lunes a las 09:00"*. El
+pipeline no consultaba la tabla `booking`: la única fuente del modelo era su
+propio "¡Listo! Te agendé…" del historial.
+
+Automatizado en `scripts/e2e-selftest.mjs`, dentro de `agendaChecks()`. Guion
+manual equivalente, con `AGENDA=on` y el agente encendido:
+
+1. Agendar una cita por WhatsApp con el agente.
+2. Mandar `estado-cita: ¿qué tengo?`.
+   ✅ **Control positivo**: el agente nombra la cita vigente. Sin este paso, el
+   punto 5 pasaría en verde aunque el bloque nunca llegara al modelo.
+3. Mandar "quiero mover mi cita a otro día" → queda una solicitud de cambio
+   pendiente y la conversación escala.
+4. Cancelar la cita desde la pantalla de Citas.
+5. Mandar `estado-cita: ¿qué tengo?`.
+   ✅ El agente **ya no** la menciona.
+   ✅ Y lo dice explícito: no hay ninguna cita vigente.
+6. Pedir agendar de nuevo.
+   ✅ **Funciona**. Antes no: la solicitud de cambio quedaba `pending` para
+   siempre y `createSessionBooking` rebotaba con `reschedule_pending`, así que
+   el agente no podía volver a agendarle nada a ese contacto nunca.

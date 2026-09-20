@@ -60,6 +60,15 @@ export function buildAgentSystemPrompt(input: {
    * copiar es lo que hace que book_slot funcione de verdad.
    */
   offers?: { startUtc: string; label: string }[];
+  /**
+   * Incidente 2026-09-19 — el estado REAL de citas del contacto, leído de la
+   * base al armar el turno. Tipo estructural inline a propósito: este módulo
+   * no debe depender de `server/agenda/`.
+   */
+  agendaState?:
+    | { kind: "none" }
+    | { kind: "unknown" }
+    | { kind: "active"; bookings: { label: string; startUtc: string }[] };
 }): string {
   const { profile } = input;
   const stageNames = input.stages.map((s) => s.name).join(" | ");
@@ -76,10 +85,43 @@ export function buildAgentSystemPrompt(input: {
         "- book_slot solo acepta un horario que el sistema ofreció antes en ESTA conversación. Si el cliente pide otro, vuelve a ofrecer con offer_slots.",
         "- Para el `startUtc` de book_slot, COPIA TAL CUAL uno de los valores de la lista \"Horarios vigentes para agendar\" (si existe más abajo) según cuál eligió el cliente. Nunca lo calcules ni lo derives tú mismo.",
         "- Si el cliente quiere CANCELAR una cita → handoff: esa decisión no es tuya.",
-        "- Si el cliente quiere MOVER/REPROGRAMAR una cita que ya tiene → request_reschedule. Nunca uses book_slot para eso, y nunca asumas que la cita anterior quedó cancelada o movida: eso solo lo hace el equipo.",
-        "- Si el cliente YA tiene una cita agendada y pide, aparte, una reunión DISTINTA (no la misma, no moverla) → solo entonces book_slot con \"confirmAdditional\":true y un \"reason\" que explique por qué es aparte. Sin esa confirmación explícita, el sistema bloqueará solo una segunda cita para el mismo contacto — no lo tomes como error tuyo ni insistas, dile al cliente lo que el sistema respondió.",
+        "- Si el cliente quiere MOVER/REPROGRAMAR una cita que ya tiene → request_reschedule. Nunca uses book_slot para eso, y nunca anuncies TÚ que la cita quedó movida o cancelada: ese cambio lo hace el equipo y, cuando ocurra, lo verás reflejado en el bloque ESTADO DE AGENDA — no lo des por hecho antes.",
+        "- Todo lo que digas sobre citas de este contacto sale del bloque ESTADO DE AGENDA. Ese bloque gana SIEMPRE contra el historial: contra lo que dijo el cliente y contra lo que dijiste tú. Si confirmaste una cita hace diez mensajes y el bloque ya no la lista, esa cita se canceló o se movió — no la menciones como vigente.",
+        "- Si el bloque ESTADO DE AGENDA lista una cita vigente y el cliente pide, aparte, una reunión DISTINTA (no la misma, no moverla) → solo entonces book_slot con \"confirmAdditional\":true y un \"reason\" que explique por qué es aparte. Sin esa confirmación explícita, el sistema bloqueará solo una segunda cita para el mismo contacto — no lo tomes como error tuyo ni insistas, dile al cliente lo que el sistema respondió.",
       ]
     : [];
+  // Incidente 2026-09-19: sin este bloque el modelo no tenía NINGUNA fuente de
+  // verdad sobre citas y repetía su propio "te agendé" del historial, aun
+  // después de que el dueño cancelara la cita desde el CRM.
+  const AGENDA_STATE_HEADER =
+    "ESTADO DE AGENDA DE ESTE CONTACTO (dato del sistema, leído de la base de datos AHORA MISMO). Esta es la ÚNICA fuente de verdad sobre citas y MANDA sobre cualquier cosa dicha antes en esta conversación, incluidos los mensajes que TÚ MISMO enviaste: si aquí no aparece una cita, esa cita NO existe — se canceló, se movió o ya pasó — por más que más arriba en el historial encuentres una confirmación tuya.";
+  const agendaStateBlock = ((): string[] => {
+    if (!input.agenda || !input.agendaState) return [];
+    const st = input.agendaState;
+    if (st.kind === "active") {
+      return [
+        AGENDA_STATE_HEADER +
+          "\nCitas vigentes:\n" +
+          st.bookings
+            .map((b) => `- ${b.label} → startUtc: "${b.startUtc}"`)
+            .join("\n") +
+          "\nNo inventes hora, día ni enlace: si hablas de la cita, usa la etiqueta tal cual aparece arriba.",
+      ];
+    }
+    if (st.kind === "none") {
+      // El caso negativo es obligatorio: el fallo no fue que el modelo no
+      // supiera, fue que AFIRMÓ una cita apoyándose en el historial. Solo una
+      // afirmación explícita le gana a esa.
+      return [
+        AGENDA_STATE_HEADER +
+          "\nEste contacto NO tiene NINGUNA cita vigente. Nunca le recuerdes una cita, ni la des por hecha, ni le preguntes si sigue en pie: no hay ninguna. Si el cliente menciona una cita suya, no la confirmes ni la niegues de plano: dile que lo revisas con el equipo, o usa offer_slots si lo que quiere es agendar. Esto es CONTEXTO, no un tema que debas sacar tú: no le anuncies que no tiene cita si él no preguntó.",
+      ];
+    }
+    return [
+      AGENDA_STATE_HEADER +
+        "\nAhora mismo NO pude verificar el estado de la agenda de este contacto. Por lo tanto no afirmes NINGUNA cita ni ninguna hora: si el tema sale, di que lo confirmas con el equipo y sigues.",
+    ];
+  })();
   const offersBlock =
     input.agenda && input.offers && input.offers.length > 0
       ? [
@@ -99,6 +141,7 @@ export function buildAgentSystemPrompt(input: {
     profile.greeting ? `Saludo sugerido para conversaciones nuevas: ${profile.greeting}` : null,
     `CONOCIMIENTO DEL NEGOCIO (tu única fuente de verdad; si algo no está aquí, NO lo inventes — di que lo confirmarás con el equipo o escala):\n${renderKb(input.kb)}`,
     `Etapas del pipeline disponibles: ${stageNames}`,
+    ...agendaStateBlock,
     ...offersBlock,
     [
       "En cada turno respondes ÚNICAMENTE un objeto JSON con UNA acción:",

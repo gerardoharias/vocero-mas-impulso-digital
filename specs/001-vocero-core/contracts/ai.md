@@ -42,6 +42,15 @@ const AgentAction = z.discriminatedUnion('action', [
   (global + conversación + sin handoff). Debounce (coalesce) 6s producción / 0 en
   Laboratorio; lock in-process por `conversation_id`; los mensajes que llegan durante el
   turno se re-encolan.
+- Con la agenda encendida, el prompt lleva el bloque ESTADO DE AGENDA: las
+  citas vigentes del contacto leídas de la base al armar el turno
+  (`server/agenda/agent.ts` → `readAgendaState`), o la afirmación explícita de
+  que no tiene ninguna. Ese bloque es la ÚNICA fuente de verdad sobre citas y
+  manda sobre el historial, incluidos los mensajes que el propio agente envió:
+  sin él, una cita cancelada desde el CRM seguía "viva" para el modelo. El
+  Laboratorio lee su propio sandbox (`booking.is_test`), nunca las citas
+  reales. Si la lectura falla, el bloque dice que no se pudo verificar — jamás
+  degrada a "no tiene cita".
 - Si el proveedor no devuelve JSON pero SÍ texto utilizable, ese texto se
   entrega como respuesta (`server/ai/salvage.ts`) en vez de escalar: un hipo de
   formato no cuesta una respuesta. Se descarta —y entonces sí escala— el texto

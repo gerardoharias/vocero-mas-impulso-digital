@@ -551,6 +551,26 @@ export async function cancelBooking(input: {
     .set({ status: "cancelada", updatedAt: new Date() })
     .where(eq(schema.booking.id, booking.id));
 
+  // Incidente 2026-09-19 — cancelar desde la pantalla de Citas dejaba VIVA la
+  // solicitud de cambio de horario del contacto: `pending` para siempre. Y un
+  // pendiente hace que `createSessionBooking` (arriba) lance
+  // `reschedule_pending`, así que el agente ya no podía volver a agendarle
+  // nada a ese prospecto — por una cita que ya no existe. Cancelar la cita SÍ
+  // atiende el pedido de moverla: no queda nada que mover.
+  //
+  // Va DENTRO del camino que sí trabaja (después del early return de
+  // idempotencia) a propósito: solo puede haber una solicitud pendiente por
+  // contacto, así que cancelar dos veces una cita ya muerta podría resolver el
+  // pedido de OTRA cita viva.
+  if (booking.contactId) {
+    await resolvePendingRescheduleRequests(
+      input.organizationId,
+      booking.contactId
+    ).catch((err) => {
+      console.warn(`[agenda] no pude resolver el cambio pendiente: ${err}`);
+    });
+  }
+
   const settings = await getSettings(input.organizationId);
   await withConnector(booking, settings, async (conn, externalRef) => {
     await conn.deleteMeeting(externalRef);
@@ -872,9 +892,38 @@ async function advanceLeadStage(
 export const ACTIVE_STATUSES = ["agendada", "realizada"] as const;
 
 /**
+ * El predicado ÚNICO de "cita que ocupa agenda de verdad", para que el
+ * blindaje de escritura y la lectura de contexto no puedan desfasarse el día
+ * que alguien toque `ACTIVE_STATUSES`.
+ */
+function activeBookingWhere(
+  organizationId: string,
+  contactId: string,
+  opts: { isTest: boolean; now?: Date }
+) {
+  return scoped(
+    schema.booking.organizationId,
+    organizationId,
+    and(
+      eq(schema.booking.contactId, contactId),
+      eq(schema.booking.kind, "session"),
+      eq(schema.booking.isTest, opts.isTest),
+      inArray(schema.booking.status, [...ACTIVE_STATUSES]),
+      gte(schema.booking.scheduledAt, opts.now ?? new Date())
+    )
+  );
+}
+
+/**
  * La cita activa (futura, `session`, no de prueba) de un contacto, si tiene
  * una. Lo usa el blindaje de `createSessionBooking` — y quien conduzca la
  * conversación, para nombrarla en vez de responder en genérico.
+ *
+ * `is_test = false` NO se parametriza a propósito: esta función es el blindaje
+ * que se apoya en el índice único `booking_org_contact_single_active_uq`, y
+ * ese índice parcial solo cubre las citas reales. Un `isTest` opcional aquí
+ * invitaría a llamarla con `true` creyendo que garantiza algo que la base no
+ * garantiza. Para MIRAR el sandbox está `listActiveBookings`.
  */
 export async function findActiveBooking(
   organizationId: string,
@@ -885,22 +934,32 @@ export async function findActiveBooking(
   const rows = await db
     .select()
     .from(schema.booking)
-    .where(
-      scoped(
-        schema.booking.organizationId,
-        organizationId,
-        and(
-          eq(schema.booking.contactId, contactId),
-          eq(schema.booking.kind, "session"),
-          eq(schema.booking.isTest, false),
-          inArray(schema.booking.status, [...ACTIVE_STATUSES]),
-          gte(schema.booking.scheduledAt, opts.now ?? new Date())
-        )
-      )
-    )
+    .where(activeBookingWhere(organizationId, contactId, { isTest: false, now: opts.now }))
     .orderBy(asc(schema.booking.scheduledAt))
     .limit(1);
   return rows[0] ?? null;
+}
+
+/**
+ * Incidente 2026-09-19 — lector de CONTEXTO: las citas vigentes de un contacto
+ * para contarle al agente el estado real. Es hermano de `findActiveBooking`,
+ * no un sustituto: aquél blinda una escritura, éste solo informa, y por eso
+ * puede mirar el sandbox del Laboratorio (`isTest`) y devolver más de una
+ * (un contacto con `additional_confirmed` legítimamente tiene dos, y nombrar
+ * solo la más próxima sería contarle media verdad al modelo).
+ */
+export async function listActiveBookings(
+  organizationId: string,
+  contactId: string,
+  opts: { isTest: boolean; now?: Date; limit?: number }
+): Promise<BookingRow[]> {
+  const db = getDb();
+  return await db
+    .select()
+    .from(schema.booking)
+    .where(activeBookingWhere(organizationId, contactId, opts))
+    .orderBy(asc(schema.booking.scheduledAt))
+    .limit(opts.limit ?? 3);
 }
 
 async function getBookingLabel(

@@ -1781,6 +1781,111 @@ async function agendaChecks() {
     JSON.stringify(ultimoMax)
   );
 
+  console.log(
+    "\n== Incidente 2026-09-19: una cita CANCELADA en el CRM deja de existir para el agente =="
+  );
+  // El dueño agendó una demo con el agente, la canceló desde la pantalla de
+  // Citas, y al escribir de nuevo el agente le respondió "te recuerdo que
+  // tienes tu demostración agendada". No consultaba la tabla `booking`: su
+  // única fuente era su propio "¡Listo! Te agendé…" del historial.
+  const LEAD_CANCEL = `52146${RUN}07`;
+  const LEAD_CANCEL_NORM = LEAD_CANCEL.replace(/^521/, "52");
+  const NOMBRE_CANCEL = `Lead cita cancelada ${RUN}`;
+
+  async function turnoCancel(texto, n) {
+    await api("/api/dev/wa-mock/inbound", {
+      method: "POST",
+      body: JSON.stringify({
+        phoneNumberId: PN,
+        from: LEAD_CANCEL,
+        name: NOMBRE_CANCEL,
+        text: texto,
+        waMessageId: `wamid.e2e.cancel.${RUN}.${n}`,
+      }),
+    });
+    await sleep(coalesceMs + 3000);
+    const outbox = (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
+    const ultimo = outbox.filter((o) => o.to === LEAD_CANCEL_NORM).pop();
+    return ultimo?.body?.text?.body ?? "";
+  }
+
+  async function citaActivaDe(contactId) {
+    const bookings = (await api("/api/bookings")).json?.bookings ?? [];
+    return bookings.find(
+      (b) =>
+        b.contact?.id === contactId &&
+        (b.status === "agendada" || b.status === "realizada")
+    );
+  }
+
+  await turnoCancel("quiero agendar una cita", 1);
+  await turnoCancel("sí, agenda el primero", 2);
+
+  const convsCancel = (await api("/api/conversations")).json?.conversations ?? [];
+  const convCancel = convsCancel.find((c) => c.contact.phone === LEAD_CANCEL_NORM);
+  const citaViva = await citaActivaDe(convCancel?.contact.id);
+  ok(
+    "el prospecto quedó con una cita activa",
+    !!citaViva,
+    JSON.stringify(citaViva)
+  );
+
+  // CONTROL POSITIVO. Sin este paso, el check de abajo pasaría en verde sin
+  // probar nada: bastaría con que el agente nunca hablara de citas.
+  const conCita = await turnoCancel("estado-cita: ¿qué tengo?", 3);
+  ok(
+    "CONTROL: con la cita viva, el agente SÍ la ve en su contexto",
+    /te recuerdo que tienes tu cita/i.test(conCita),
+    conCita
+  );
+
+  // El prospecto pide moverla: queda una solicitud de cambio PENDIENTE, que
+  // es lo que luego bloqueaba cualquier cita nueva.
+  await turnoCancel("quiero mover mi cita a otro día", 4);
+  await api(`/api/conversations/${convCancel?.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ reactivate: true }),
+  });
+
+  // EL INCIDENTE: el dueño cancela desde el CRM.
+  const cancelRes = await api(`/api/bookings/${citaViva?.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ action: "cancel" }),
+  });
+  ok("la cita se cancela desde el CRM", cancelRes.res.ok, JSON.stringify(cancelRes.json));
+  ok(
+    "…y queda 'cancelada' en la base",
+    !(await citaActivaDe(convCancel?.contact.id)),
+    "todavía aparece una cita activa"
+  );
+
+  const sinCita = await turnoCancel("estado-cita: ¿qué tengo?", 5);
+  ok(
+    "el agente YA NO le recuerda una cita que fue cancelada",
+    !/te recuerdo que tienes tu cita/i.test(sinCita),
+    sinCita
+  );
+  ok(
+    "…y sabe explícitamente que no hay ninguna",
+    /no tienes ninguna cita/i.test(sinCita),
+    sinCita
+  );
+
+  // La solicitud de cambio huérfana: sin el arreglo, esto responde "voy a
+  // confirmar el cambio con el equipo" para siempre y nunca vuelve a agendar.
+  await turnoCancel("quiero agendar una cita", 6);
+  const trasReagendar = await turnoCancel("sí, agenda el primero", 7);
+  ok(
+    "cancelar resolvió la solicitud huérfana: se puede volver a agendar",
+    !!(await citaActivaDe(convCancel?.contact.id)),
+    trasReagendar
+  );
+  ok(
+    "…y el agente NO respondió con la copia de 'cambio pendiente'",
+    !/confirmar el cambio con el equipo/i.test(trasReagendar),
+    trasReagendar
+  );
+
   // Se apaga de vuelta: el resto del guion asume el agente in-process OFF.
   await api("/api/agent/profile", {
     method: "PUT",
