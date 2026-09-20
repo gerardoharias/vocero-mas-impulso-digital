@@ -19,7 +19,12 @@ import { matchesHandoffIntent } from "@/server/ai/handoff";
 import { buildAgentSystemPrompt } from "@/server/ai/prompts";
 import { salvageProse } from "@/server/ai/salvage";
 import { agendaEnabled } from "@/server/agenda/flag";
-import { bookSlot, offerSlots, recordRescheduleRequest } from "@/server/agenda/agent";
+import {
+  bookSlot,
+  offerSlots,
+  readAgendaState,
+  recordRescheduleRequest,
+} from "@/server/agenda/agent";
 import { getOffers } from "@/server/agenda/offers";
 import { awaitMediaJob } from "@/server/whatsapp/media";
 import { recordAiNote } from "@/server/contacts/notes";
@@ -308,11 +313,34 @@ export async function runAgentTurn(
   // que él mismo mandó al cliente, y tiene que ADIVINAR el instante UTC exacto
   // para book_slot — findOffered exige el epoch exacto (sin tolerancia, a
   // propósito), así que sin la lista real el agendado nunca cierra.
-  const offers = agenda ? await getOffers(organizationId, conversationId) : [];
+  // En paralelo: son dos lecturas independientes y en serie alargarían el
+  // turno sin motivo.
+  const [offers, agendaState] = agenda
+    ? await Promise.all([
+        getOffers(organizationId, conversationId),
+        // El estado REAL de citas. Sin esto el modelo no tenía ninguna fuente
+        // de verdad y repetía su propio "te agendé" del historial aunque el
+        // dueño hubiera cancelado la cita (incidente 2026-09-19).
+        // `isTest` mantiene separados los dos mundos: el Laboratorio mira su
+        // sandbox, una conversación real mira las citas del negocio.
+        readAgendaState({
+          organizationId,
+          contactId: conversation.contactId,
+          isTest: conversation.isTest,
+        }),
+      ])
+    : [[], undefined];
   const messages: ChatMessage[] = [
     {
       role: "system",
-      content: buildAgentSystemPrompt({ profile, kb, stages, agenda, offers }),
+      content: buildAgentSystemPrompt({
+        profile,
+        kb,
+        stages,
+        agenda,
+        offers,
+        agendaState,
+      }),
     },
     ...(await historyAsChatMessages(history)),
   ];

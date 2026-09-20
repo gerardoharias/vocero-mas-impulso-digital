@@ -7,7 +7,9 @@ import {
   BookingError,
   createSessionBooking,
   findActiveBooking,
+  listActiveBookings,
 } from "@/server/agenda/service";
+import { labelInTz } from "@/lib/time/slots";
 import { requestReschedule } from "@/server/agenda/reschedule-requests";
 
 /**
@@ -26,6 +28,58 @@ import { requestReschedule } from "@/server/agenda/reschedule-requests";
 const SHOWN = 3;
 /** Cuántos se guardan como reservables: el catálogo es más ancho que el menú. */
 const OFFERED = 12;
+
+/**
+ * Incidente 2026-09-19 — el dueño canceló una cita desde la pantalla de Citas
+ * y, al siguiente "hola", el agente se la recordó igual. No era terquedad del
+ * modelo: NO tenía ningún dato de citas en su contexto y estaba repitiendo su
+ * propio "¡Listo! Te agendé para el lunes a las 09:00", que sigue en el
+ * historial. Éste es el dato que faltaba.
+ *
+ * `unknown` NO es un lujo: si la lectura falla, degradar a "no tiene cita"
+ * sería afirmar algo falso, solo que al revés. La única salida honesta es "no
+ * lo pude verificar".
+ */
+export type AgendaState =
+  | { kind: "none" }
+  | { kind: "active"; bookings: { label: string; startUtc: string }[] }
+  | { kind: "unknown" };
+
+/**
+ * El estado real de citas del contacto, para inyectarlo en el prompt. Nunca
+ * lanza: un fallo del motor degrada el turno, jamás lo tumba.
+ */
+export async function readAgendaState(input: {
+  organizationId: string;
+  contactId: string;
+  /** El Laboratorio mira SU sandbox; una conversación real, las citas reales. */
+  isTest: boolean;
+  now?: Date;
+}): Promise<AgendaState> {
+  try {
+    const rows = await listActiveBookings(input.organizationId, input.contactId, {
+      isTest: input.isTest,
+      now: input.now,
+    });
+    if (rows.length === 0) return { kind: "none" };
+    // getSettings solo se paga cuando SÍ hay cita: el caso común (sin cita)
+    // cuesta una query, no dos.
+    const settings = await getSettings(input.organizationId);
+    return {
+      kind: "active",
+      bookings: rows.map((b) => ({
+        // El MISMO helper que produjo la etiqueta que el cliente ya vio al
+        // agendar: si no coincidiera letra por letra, el modelo podría creer
+        // que son dos citas distintas.
+        label: labelInTz(b.scheduledAt.toISOString(), settings.timezone),
+        startUtc: b.scheduledAt.toISOString(),
+      })),
+    };
+  } catch (err) {
+    console.warn(`[agenda] no pude leer el estado de citas del contacto: ${err}`);
+    return { kind: "unknown" };
+  }
+}
 
 /**
  * Auditoría 2026-09-17 — el DESENLACE exacto del turno de agenda, para que
