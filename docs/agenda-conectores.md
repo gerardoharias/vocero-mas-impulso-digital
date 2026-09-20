@@ -56,6 +56,11 @@ API de Calendar activada, y de ahí *Client ID*, *Client Secret* y un *refresh
 token* con el permiso `calendar.events`. El calendario destino es `primary`
 salvo que pongas otro.
 
+> `calendar.events` es **todo** lo que hace falta, también para el botón
+> **Probar**: la prueba de conexión pega a `events.list`, no a `calendars.get`.
+> No agrandes el scope a `calendar` ni a `calendar.readonly` — son más amplios
+> de lo necesario y complican la verificación de tu app OAuth.
+
 > ⚠️ **Publica tu app OAuth "en producción".** Si la dejas en modo prueba,
 > Google **revoca el refresh token a los 7 días** y tus citas dejarán de generar
 > enlace sin previo aviso. Cuando pasa, el CRM marca la conexión como rota y te
