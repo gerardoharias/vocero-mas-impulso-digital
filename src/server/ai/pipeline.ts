@@ -17,6 +17,7 @@ import {
 } from "@/server/ai/actions";
 import { matchesHandoffIntent } from "@/server/ai/handoff";
 import { buildAgentSystemPrompt } from "@/server/ai/prompts";
+import { salvageProse } from "@/server/ai/salvage";
 import { agendaEnabled } from "@/server/agenda/flag";
 import { bookSlot, offerSlots, recordRescheduleRequest } from "@/server/agenda/agent";
 import { getOffers } from "@/server/agenda/offers";
@@ -277,13 +278,13 @@ export async function runAgentTurn(
 
   // Ventana cerrada: el agente JAMÁS envía texto libre → handoff 'ventana'.
   if (!conversation.isTest && !isWindowOpen(conversation.lastInboundAt)) {
-    await applyHandoff(conversationId, organizationId, "ventana");
+    await escalate(conversation, "ventana");
     return;
   }
 
   // Patrón de respaldo ANTES del LLM (FR-022).
   if (lastInbound.text && matchesHandoffIntent(lastInbound.text)) {
-    await applyHandoff(conversationId, organizationId, "cliente");
+    await escalate(conversation, "cliente");
     return;
   }
 
@@ -320,9 +321,29 @@ export async function runAgentTurn(
   const result = await chatJson(agentActionSchema(agenda), messages, aiConfig);
   if (!result.ok) {
     if (result.error === "not_configured") return;
+
+    // Red de rescate: si el proveedor llegó a producir texto utilizable pero
+    // sin envolverlo en JSON, se entrega como respuesta en vez de escalar.
+    // Un hipo de FORMATO no puede costar una respuesta que el modelo ya dio
+    // (incidente del 2026-09-19). Un fallo REAL del proveedor no trae texto
+    // que rescatar, así que sigue escalando por el camino de abajo.
+    const rescatado = salvageProse(result.raw);
+    if (rescatado) {
+      console.warn(
+        `[agente] el proveedor no devolvió JSON; se rescata su texto (conv ${conversationId}): ${result.detail}`
+      );
+      try {
+        await deliverReply(conversation, rescatado);
+        return;
+      } catch (err) {
+        // El rescate no se pudo entregar: NO nos quedamos callados, se escala.
+        console.error(`[agente] el texto rescatado no se pudo entregar: ${err}`);
+      }
+    }
+
     // Fallo persistente del proveedor o salida imposible → escalar (FR-022).
     console.error(`[agente] fallo del proveedor (raw): ${result.detail}`);
-    await applyHandoff(conversationId, organizationId, "error");
+    await escalate(conversation, "error");
     return;
   }
 
@@ -437,16 +458,9 @@ export async function runAgentTurn(
       // el estado de la conversación registraran el traspaso). Con el orden
       // invertido, el peor caso pasa a ser "se aplicó el traspaso pero la
       // despedida no salió" — nunca al revés.
-      await applyHandoff(conversationId, organizationId, "modelo");
-      if (action.farewell) {
-        try {
-          await deliverReply(conversation, action.farewell);
-        } catch (err) {
-          console.error(
-            `[agente] traspaso aplicado pero la despedida no se pudo enviar: ${err}`
-          );
-        }
-      }
+      // Sin `farewell` el cliente ya no se queda mudo: escalate pone la
+      // copia fija del sistema.
+      await escalate(conversation, "modelo", { farewell: action.farewell });
       return;
     }
   }
@@ -502,11 +516,77 @@ async function persistTestOutbound(
     .where(eq(schema.conversation.id, conversation.id));
 }
 
+/**
+ * Derivado del enum de la BD: la unión escrita a mano que había aquí omitía
+ * `hostilidad` y `manual_reply`, que sí existen en `schema.conversation`.
+ */
+export type HandoffReason = NonNullable<
+  (typeof schema.conversation.$inferSelect)["handoffReason"]
+>;
+
+/**
+ * Copia FIJA del sistema, nunca del LLM. No es configurable por ahora
+ * (decisión del dueño): si algún día lo es, su sitio es `agent_profile`.
+ * Mismo patrón que los avisos de reprogramación en `server/agenda/agent.ts`.
+ */
+const HANDOFF_NOTICE =
+  "Voy a pasar tu mensaje con una persona del equipo para darte la respuesta correcta. En un momento te escriben por aquí 🙌";
+
+/**
+ * Motivos en los que el cliente DEBE recibir aviso.
+ *
+ * ALLOWLIST, jamás denylist: un motivo nuevo tiene que caer por defecto en "no
+ * avisar". Quedan fuera a propósito:
+ *  - `ventana`: con la ventana de 24 h cerrada el agente JAMÁS manda texto
+ *    libre (guardrail del canal); el envío rebotaría igual.
+ *  - `reprogramacion`: ya manda su propio texto, más específico.
+ *  - `manual_reply`: el dueño contestó desde su teléfono — decirle al cliente
+ *    "te paso con una persona" justo ahí sería absurdo.
+ *  - `hostilidad`: el cliente no debe enterarse de por qué se cortó.
+ */
+const NOTICE_REASONS = new Set<HandoffReason>(["cliente", "modelo", "error"]);
+
+/**
+ * Escala a atención humana Y avisa al cliente.
+ *
+ * Antes, escalar era SILENCIOSO en todos los motivos automáticos: el prospecto
+ * se quedaba esperando una respuesta que no iba a llegar, y el negocio solo se
+ * enteraba si alguien miraba la bandeja. Incidente del 2026-09-19.
+ *
+ * El orden (persistir primero, avisar después) está congelado por
+ * `tests/unit/pipeline-handoff-order.test.ts`: un envío que falla nunca puede
+ * impedir que el traspaso quede registrado.
+ */
+async function escalate(
+  conversation: Conversation,
+  reason: HandoffReason,
+  opts?: { farewell?: string | null }
+): Promise<void> {
+  const aplicado = await applyHandoff(
+    conversation.id,
+    conversation.organizationId,
+    reason
+  );
+  // Ya estaba escalada: el cliente no debe recibir el aviso dos veces.
+  if (!aplicado) return;
+  if (!NOTICE_REASONS.has(reason)) return;
+
+  const texto = opts?.farewell?.trim() || HANDOFF_NOTICE;
+  try {
+    await deliverReply(conversation, texto);
+  } catch (err) {
+    console.error(
+      `[agente] traspaso (${reason}) aplicado pero el aviso no se pudo enviar: ${err}`
+    );
+  }
+}
+
+/** @returns true solo si ESTA llamada aplicó el traspaso (gancho de idempotencia del aviso). */
 export async function applyHandoff(
   conversationId: string,
   organizationId: string,
-  reason: "cliente" | "modelo" | "error" | "ventana" | "reprogramacion"
-): Promise<void> {
+  reason: HandoffReason
+): Promise<boolean> {
   const db = getDb();
   // Idempotente a propósito (WHERE handoff_at IS NULL): un segundo intento de
   // traspaso sobre la MISMA conversación (p. ej. la despedida del handoff de
@@ -522,13 +602,14 @@ export async function applyHandoff(
       )
     )
     .returning();
-  if (!updated[0]) return;
+  if (!updated[0]) return false;
   publish(organizationId, {
     type: "conversation.updated",
     data: {
       conversation: { id: conversationId, handoffReason: reason },
     },
   });
+  return true;
 }
 
 async function moveLeadToStage(

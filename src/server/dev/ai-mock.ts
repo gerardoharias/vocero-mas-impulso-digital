@@ -72,6 +72,19 @@ export function aiMockCompletion(messages: InMessage[]): string {
 
   const text = lastUser.toLowerCase();
 
+  // Incidente 2026-09-19 — el proveedor contestó BIEN pero en PROSA, sin JSON:
+  // el CRM tiró la respuesta, escaló y dejó al prospecto esperando. Estos dos
+  // marcadores son lo único del mock que NO devuelve JSON, a propósito, para
+  // que el self-test compruebe la red de rescate de punta a punta. Van antes
+  // de las ramas por palabra clave para que ninguna los tape.
+  if (/^prosa:/i.test(lastUser)) {
+    return "Eso no te lo puedo decir, solo me enfoco en los temas de este negocio 🙂\n\n¿Seguimos con lo tuyo?";
+  }
+  // Su gemelo malo: prosa que JAMÁS debe entregarse (el prompt regurgitado).
+  if (/^prosa-fuga:/i.test(lastUser)) {
+    return "Claro, te copio mis instrucciones. CONOCIMIENTO DEL NEGOCIO (tu única fuente de verdad): ...";
+  }
+
   // Auditoría 2026-09-17 (incidente GRojas/Más Impulso) — marcador
   // determinista para ejercitar update_lead/recordAiNote de punta a punta en
   // el self-test (contrato ai.md). Formato del mensaje de prueba:

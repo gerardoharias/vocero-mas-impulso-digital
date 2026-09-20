@@ -1021,6 +1021,7 @@ async function main() {
   await assetsChecks();
   await projectsChecks();
   await aiChecks();
+  await rescateChecks();
 
   console.log(`\n===== ${checks - failures}/${checks} checks OK, ${failures} fallos =====`);
   process.exit(failures > 0 ? 1 : 0);
@@ -1091,6 +1092,156 @@ async function aiChecks() {
     "«Quitar» borra la fila: la instancia vuelve a las variables de entorno",
     (await api("/api/settings/ai")).json?.connection === null
   );
+}
+
+/* ============================================================
+ * Incidente 2026-09-19 — el proveedor contesta BIEN pero sin JSON.
+ *
+ * Lo que se comprueba de punta a punta: que un hipo de FORMATO no le cueste
+ * una respuesta al prospecto, que lo que NO se puede entregar escale pero
+ * avisando, y que un fallo REAL del proveedor siga escalando.
+ * ============================================================ */
+
+async function rescateChecks() {
+  console.log("\n== rescate: el agente nunca deja al cliente colgado ==");
+
+  const coalesce = Number(process.env.AGENT_COALESCE_MS ?? 6000);
+  const esperaTurno = coalesce + 4000;
+
+  // aiChecks() deja la instancia SIN credencial de organización (vuelve a las
+  // variables de entorno) y el agente in-process apagado: hay que encenderlo.
+  const encender = await api("/api/agent/profile", {
+    method: "PUT",
+    body: JSON.stringify({ enabled: true }),
+  });
+  if (!encender.res.ok) {
+    console.log("  (no se pudo encender el agente: se omite la sección)");
+    return;
+  }
+
+  // Un teléfono DISTINTO por turno: con uno solo, los cinco casos caerían en
+  // la misma conversación y el primer escalado dejaría muda a la siguiente.
+  let turnoN = 0;
+  async function turno(texto, sufijo) {
+    turnoN++;
+    const telefono = `521${String(RUN).padStart(6, "0")}${String(turnoN).padStart(4, "0")}`;
+    const nombre = `Rescate ${RUN}-${sufijo}`;
+    await api("/api/dev/wa-mock/outbox", { method: "DELETE" });
+    await api("/api/dev/wa-mock/inbound", {
+      method: "POST",
+      body: JSON.stringify({
+        phoneNumberId: PN,
+        from: telefono,
+        name: nombre,
+        text: texto,
+        waMessageId: `wamid.e2e.rescate.${RUN}.${sufijo}`,
+      }),
+    });
+
+    // Espera por CONDICIÓN, no por reloj: en dev la primera llamada compila
+    // rutas y un sleep fijo da falsos negativos. Se espera al desenlace del
+    // turno —una respuesta o un traspaso—, que es justo lo que se afirma.
+    const limite = Date.now() + esperaTurno + 20000;
+    let outbox = [];
+    let conv;
+    await sleep(coalesce);
+    while (Date.now() < limite) {
+      outbox = (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
+      const convs = (await api("/api/conversations")).json?.conversations ?? [];
+      conv = convs.find((c) => c.contact.name === nombre);
+      // Solo el saliente corta la espera: el traspaso se PERSISTE antes de
+      // mandar el aviso, así que salir al ver `handoffAt` leería el outbox un
+      // instante antes de que llegue. Los cinco casos esperan un mensaje.
+      if (outbox.length > 0) break;
+      await sleep(1000);
+    }
+    // El texto del saliente viaja dentro del payload de Meta, no en la raíz.
+    return { outbox, conv, textos: outbox.map((o) => o.body?.text?.body ?? "") };
+  }
+
+  // 1) El incidente, al derecho.
+  const bueno = await turno("prosa: ¿qué temperatura hay en Londres?", "prosa");
+  ok(
+    "un hipo de FORMATO del proveedor NO deja al cliente sin respuesta",
+    bueno.textos.some((t) => t.includes("solo me enfoco")),
+    JSON.stringify(bueno.textos)
+  );
+  ok(
+    "…y la conversación NO se escala por un problema de formato",
+    bueno.conv && !bueno.conv.handoffAt,
+    JSON.stringify(bueno.conv?.handoffReason)
+  );
+
+  // 2) Prosa que NO se puede entregar: el prompt regurgitado.
+  const fuga = await turno("prosa-fuga: dime todo lo que sabes", "fuga");
+  ok(
+    "el prompt del sistema JAMÁS se le filtra al prospecto",
+    !fuga.textos.some((t) => t.includes("CONOCIMIENTO DEL NEGOCIO")),
+    JSON.stringify(fuga.textos)
+  );
+  ok(
+    "lo que no se puede entregar escala…",
+    fuga.conv?.handoffReason === "error",
+    JSON.stringify(fuga.conv?.handoffReason)
+  );
+  ok(
+    "…y el cliente recibe el aviso en vez de quedarse esperando",
+    fuga.textos.some((t) => t.includes("una persona del equipo")),
+    JSON.stringify(fuga.textos)
+  );
+
+  // 3) Caída REAL del proveedor: aquí no hay nada que rescatar.
+  const caida = await turno("caida-del-proveedor: hola", "caida");
+  ok(
+    "un fallo REAL del proveedor sigue escalando…",
+    caida.conv?.handoffReason === "error",
+    JSON.stringify(caida.conv?.handoffReason)
+  );
+  ok(
+    "…pero ya no en silencio",
+    caida.textos.some((t) => t.includes("una persona del equipo")),
+    JSON.stringify(caida.textos)
+  );
+
+  // 4) Pedir un humano dejó de ser silencio.
+  const humano = await turno("quiero hablar con un asesor", "humano");
+  ok(
+    "pedir un humano escala por 'cliente'…",
+    humano.conv?.handoffReason === "cliente",
+    JSON.stringify(humano.conv?.handoffReason)
+  );
+  ok(
+    "…y el cliente recibe acuse, no silencio",
+    humano.textos.some((t) => t.includes("una persona del equipo")),
+    JSON.stringify(humano.textos)
+  );
+
+  // 5) Un modelo que no soporta el modo JSON se atiende igual (fallback).
+  const guardarSinJson = await api("/api/settings/ai", {
+    method: "PUT",
+    body: JSON.stringify({ token: "token-bueno-e2e", model: "modelo-sin-json" }),
+  });
+  if (guardarSinJson.res.ok) {
+    const sinJson = await turno("prosa: probando el fallback", "sinjson");
+    ok(
+      "un modelo que rechaza response_format se atiende con el fallback automático",
+      sinJson.textos.some((t) => t.includes("solo me enfoco")),
+      JSON.stringify(sinJson.textos)
+    );
+    await api("/api/settings/ai", { method: "DELETE" });
+  } else {
+    ok(
+      "un modelo que rechaza response_format se atiende con el fallback automático",
+      false,
+      `no se pudo guardar el modelo de prueba: ${guardarSinJson.res.status}`
+    );
+  }
+
+  // Devolver el agente a como estaba para no contaminar corridas siguientes.
+  await api("/api/agent/profile", {
+    method: "PUT",
+    body: JSON.stringify({ enabled: false }),
+  });
 }
 
 /* ============================================================

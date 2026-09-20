@@ -20,7 +20,24 @@ export type ChatMessage = {
 
 export type ChatJsonResult<T> =
   | { ok: true; data: T; raw: string }
-  | { ok: false; error: "not_configured" | "provider_error" | "invalid_output"; detail: string };
+  | {
+      ok: false;
+      error: "not_configured" | "provider_error" | "invalid_output";
+      detail: string;
+      /**
+       * Contenido CRUDO y COMPLETO de la última respuesta CON contenido del
+       * proveedor. Su AUSENCIA es información: significa que el proveedor
+       * nunca llegó a hablar (5xx, 429 agotado, timeout, respuesta vacía —
+       * `callProvider` lanza antes de devolver texto), o sea que no hay nada
+       * que rescatar.
+       *
+       * Este adaptador NO decide qué hacer con él: es genérico sobre cualquier
+       * esquema Zod (lo usan el juez del Laboratorio y la transcripción) y no
+       * puede asumir que existe una acción `reply`. Esa política vive en
+       * `server/ai/salvage.ts`.
+       */
+      raw?: string;
+    };
 
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 500;
@@ -43,6 +60,8 @@ class RateLimitError extends Error {
 const globalForAi = globalThis as unknown as {
   __aiActive?: number;
   __aiQueue?: (() => void)[];
+  /** Modelos que rechazaron `response_format` (ver callProvider). */
+  __aiNoJsonMode?: Set<string>;
 };
 function acquireSlot(): Promise<() => void> {
   globalForAi.__aiActive ??= 0;
@@ -105,6 +124,15 @@ export async function chatJson<T>(
   const release = await acquireSlot();
   try {
     let lastDetail = "";
+    // El raw del ÚLTIMO intento que trajo contenido. Queda `undefined` si el
+    // proveedor nunca habló: ese hueco es el que distingue "fallo real" de
+    // "el modelo contestó, pero con otro formato" (ver ChatJsonResult).
+    let lastRaw: string | undefined;
+    // Se asigna donde se CONOCE la causa. Antes se adivinaba buscando las
+    // palabras "esquema"/"JSON" en el mensaje de error, y un 500 del proveedor
+    // con cuerpo `{"error":"Invalid JSON in request"}` se contaba como culpa
+    // del modelo.
+    let lastError: "provider_error" | "invalid_output" = "provider_error";
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       const attemptMessages: ChatMessage[] =
         attempt === 1
@@ -113,8 +141,12 @@ export async function chatJson<T>(
               ...messages,
               {
                 role: "system",
+                // Agnóstico del esquema a propósito: por aquí pasan también el
+                // juez del Laboratorio y la transcripción de audio.
                 content:
-                  "STRICT: tu respuesta anterior no fue JSON válido según el esquema. Responde ÚNICAMENTE el objeto JSON, sin explicaciones ni markdown.",
+                  attempt === 2
+                    ? "STRICT: tu respuesta anterior NO fue un objeto JSON válido según el esquema. Responde ÚNICAMENTE el objeto JSON: empieza por { y termina en }, sin markdown, sin explicaciones y sin una sola palabra fuera de él."
+                    : "ÚLTIMO INTENTO. Devuelve SOLO el objeto JSON. Nada antes, nada después.",
               },
             ];
       try {
@@ -124,13 +156,16 @@ export async function chatJson<T>(
           opts?.timeoutMs,
           apiToken
         );
+        lastRaw = raw;
         const extracted = extractJson(raw);
         if (extracted === null) {
+          lastError = "invalid_output";
           lastDetail = `sin JSON extraíble (raw=${truncate(raw)})`;
           continue;
         }
         const parsed = schema.safeParse(extracted);
         if (!parsed.success) {
+          lastError = "invalid_output";
           lastDetail = `no cumple el esquema: ${parsed.error.issues
             .map((i) => i.path.join(".") + " " + i.message)
             .join("; ")} (raw=${truncate(raw)})`;
@@ -138,6 +173,7 @@ export async function chatJson<T>(
         }
         return { ok: true, data: parsed.data, raw };
       } catch (err) {
+        lastError = "provider_error";
         lastDetail = err instanceof Error ? err.message : String(err);
         if (attempt < MAX_ATTEMPTS) {
           const delay =
@@ -149,23 +185,72 @@ export async function chatJson<T>(
       }
     }
 
-    return {
-      ok: false,
-      error: lastDetail.includes("esquema") || lastDetail.includes("JSON")
-        ? "invalid_output"
-        : "provider_error",
-      detail: lastDetail,
-    };
+    return { ok: false, error: lastError, detail: lastDetail, raw: lastRaw };
   } finally {
     release();
   }
 }
 
+/** El proveedor rechazó `response_format` porque ESTE modelo no lo soporta. */
+class JsonModeUnsupportedError extends Error {}
+
+/**
+ * Formas en que llega el rechazo del modo JSON. OpenRouter delega en el
+ * proveedor real detrás del modelo, así que no hay un código único:
+ *   404 "No endpoints found that support JSON mode"
+ *   400 "response_format is not supported" / "unsupported parameter"
+ *   422 '"response_format" is not supported'   (vLLM, Ollama, LM Studio)
+ *   400 "'messages' must contain the word 'json'"  (guard estilo OpenAI)
+ * Un 429 o un 5xx NUNCA se clasifican aquí: esos son caídas de verdad.
+ */
+const JSON_MODE_STATUSES = new Set([400, 404, 415, 422, 501]);
+const JSON_MODE_REJECT =
+  /response_format|json[_\s-]?object|json mode|must contain the word/i;
+
+/** Modelos que ya rechazaron `response_format`: se deja de mandárselo. */
+function jsonModeAllowed(model: string): boolean {
+  return !globalForAi.__aiNoJsonMode?.has(model);
+}
+function rememberNoJsonMode(model: string): void {
+  (globalForAi.__aiNoJsonMode ??= new Set()).add(model);
+}
+
+/**
+ * Pide el JSON por contrato de API (`response_format`) en vez de fiarlo solo a
+ * que el modelo obedezca el prompt, y si el modelo no lo soporta reintenta sin
+ * él y lo recuerda: una llamada extra UNA vez por modelo y proceso.
+ *
+ * Se usa `json_object` y no `json_schema` a propósito: la variante estricta
+ * exigiría derivar un JSON Schema de la unión discriminada de acciones, y
+ * buena parte de los modelos de OpenRouter la rechazan.
+ */
 async function callProvider(
   model: string,
   messages: ChatMessage[],
   timeoutMs = 60_000,
-  apiToken?: string
+  apiToken?: string,
+  jsonMode = true
+): Promise<string> {
+  if (jsonMode && jsonModeAllowed(model)) {
+    try {
+      return await postCompletion(model, messages, timeoutMs, apiToken, true);
+    } catch (err) {
+      if (!(err instanceof JsonModeUnsupportedError)) throw err;
+      rememberNoJsonMode(model);
+      console.warn(
+        `[ia] ${model} no acepta response_format json_object: se reintenta sin él y no se vuelve a mandar (${err.message})`
+      );
+    }
+  }
+  return postCompletion(model, messages, timeoutMs, apiToken, false);
+}
+
+async function postCompletion(
+  model: string,
+  messages: ChatMessage[],
+  timeoutMs: number,
+  apiToken: string | undefined,
+  jsonMode: boolean
 ): Promise<string> {
   const env = getEnv();
   const controller = new AbortController();
@@ -178,7 +263,11 @@ async function callProvider(
         Authorization: `Bearer ${apiToken ?? env.OPENROUTER_API_TOKEN}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model, messages }),
+      body: JSON.stringify({
+        model,
+        messages,
+        ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+      }),
       signal: controller.signal,
     });
     if (!res.ok) {
@@ -187,6 +276,15 @@ async function callProvider(
         throw new RateLimitError(
           `proveedor respondió 429: ${truncate(text)}`,
           parseRetryAfter(res.headers.get("retry-after"))
+        );
+      }
+      if (
+        jsonMode &&
+        JSON_MODE_STATUSES.has(res.status) &&
+        JSON_MODE_REJECT.test(text)
+      ) {
+        throw new JsonModeUnsupportedError(
+          `json_object rechazado (${res.status}): ${truncate(text)}`
         );
       }
       throw new Error(`proveedor respondió ${res.status}: ${truncate(text)}`);
@@ -219,7 +317,10 @@ export async function testAiCredentials(input: {
       input.model,
       [{ role: "user", content: "Responde solo con la palabra: ok" }],
       15_000,
-      input.apiToken
+      input.apiToken,
+      // Esta sonda pide texto plano a propósito: exigirle JSON haría que un
+      // token perfectamente bueno pareciera roto.
+      false
     );
     return { ok: true };
   } catch (err) {
@@ -265,7 +366,7 @@ export async function transcribeAudio(input: {
           {
             type: "text",
             text:
-              'Transcribe este audio a texto plano en el idioma en que se habló, tal cual se dijo, sin resumir ni traducir. Si no hay voz entendible, responde con text vacío. Responde ÚNICAMENTE {"text":"..."}.',
+              'Transcribe este audio a texto plano en el idioma en que se habló, tal cual se dijo, sin resumir ni traducir. Si no hay voz entendible, responde con text vacío. Responde ÚNICAMENTE el JSON {"text":"..."}.',
           },
           {
             type: "input_audio",
