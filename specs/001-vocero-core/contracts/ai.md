@@ -42,8 +42,20 @@ const AgentAction = z.discriminatedUnion('action', [
   (global + conversación + sin handoff). Debounce (coalesce) 6s producción / 0 en
   Laboratorio; lock in-process por `conversation_id`; los mensajes que llegan durante el
   turno se re-encolan.
+- Si el proveedor no devuelve JSON pero SÍ texto utilizable, ese texto se
+  entrega como respuesta (`server/ai/salvage.ts`) en vez de escalar: un hipo de
+  formato no cuesta una respuesta. Se descarta —y entonces sí escala— el texto
+  vacío, el JSON roto, el eco de un error del proveedor, lo que supera el largo
+  del canal más estrecho, y cualquier cosa que contenga un marcador del prompt
+  del sistema.
 - Ventana cerrada o error persistente del proveedor → handoff automático
-  (`handoff_reason: 'ventana' | 'error'`), sin enviar texto libre.
+  (`handoff_reason: 'ventana' | 'error'`).
+- Al escalar, el cliente recibe un aviso de cortesía FIJO del sistema en los
+  motivos `error`, `cliente` y `modelo` (este último solo si el modelo no puso
+  su propia `farewell`). NO se manda en `ventana` —con la ventana de 24 h
+  cerrada está prohibido el texto libre—, ni en `reprogramacion` (tiene el
+  suyo), ni en `manual_reply`/`hostilidad`. El aviso sale UNA sola vez: si la
+  conversación ya estaba escalada, no se repite.
 
 ## Juez del Laboratorio (una llamada por conversación)
 
