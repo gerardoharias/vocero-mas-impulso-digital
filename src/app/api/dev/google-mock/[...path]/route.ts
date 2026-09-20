@@ -13,8 +13,9 @@ export const dynamic = "force-dynamic";
  * incondicional en producción).
  *
  * Cubre lo que el conector usa: refrescar el token, crear/leer/mover/borrar un
- * evento y leer el calendario. Y reproduce la asincronía de la conferencia:
- * al crear NO hay enlace de Meet, y aparece en una lectura posterior.
+ * evento y listar eventos (la prueba de conexión). Y reproduce la asincronía
+ * de la conferencia: al crear NO hay enlace de Meet, y aparece en una lectura
+ * posterior.
  */
 
 type Ctx = { params: Promise<{ path: string[] }> };
@@ -86,9 +87,37 @@ export async function GET(req: Request, ctx: Ctx) {
   const unauthorized = requireToken(req);
   if (unauthorized) return unauthorized;
 
-  // GET /calendars/{id} — la prueba de conexión.
+  // GET /calendars/{id} — calendars.get. Un token emitido con `calendar.events`
+  // (el scope que pide el conector) NO lo autoriza: Google responde 403. El
+  // mock lo reproduce a propósito, para que nadie vuelva a apoyar la prueba de
+  // conexión en este endpoint sin que el self-test se ponga rojo.
   if (path[0] === "calendars" && path.length === 2) {
-    return Response.json({ id: path[1], summary: "Calendario de prueba" });
+    return Response.json(
+      {
+        error: {
+          code: 403,
+          message: "Request had insufficient authentication scopes.",
+          status: "PERMISSION_DENIED",
+          details: [
+            {
+              "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+              reason: "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+            },
+          ],
+        },
+      },
+      { status: 403 }
+    );
+  }
+
+  // GET /calendars/{id}/events — events.list, la prueba de conexión. Sí está
+  // cubierta por `calendar.events`, y trae el título del calendario.
+  if (path[0] === "calendars" && path[2] === "events" && path.length === 3) {
+    const state = googleMockState();
+    return Response.json({
+      summary: "Calendario de prueba",
+      items: [...state.events.values()].slice(0, 1).map((e) => ({ id: e.id })),
+    });
   }
 
   // GET /calendars/{id}/events/{eventId}

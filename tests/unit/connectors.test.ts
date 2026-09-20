@@ -314,6 +314,48 @@ describe("google", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("la prueba de conexión usa events.list: un token con SOLO calendar.events conecta", async () => {
+    // `calendars.get` exige `calendar`/`calendar.readonly`, que GOOGLE_SCOPE no
+    // pide. Apoyar ahí la prueba rebotaba con 403 credenciales que servían
+    // perfectamente para crear citas, y el PUT bloquea el guardado si la
+    // prueba falla: la conexión era IMPOSIBLE siguiendo nuestra propia guía.
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.endsWith("/token")) {
+        return Response.json({ access_token: "tk", expires_in: 3600 });
+      }
+      if (!new URL(url).pathname.endsWith("/events")) {
+        return Response.json(
+          {
+            error: {
+              code: 403,
+              status: "PERMISSION_DENIED",
+              message: "Request had insufficient authentication scopes.",
+            },
+          },
+          { status: 403 }
+        );
+      }
+      return Response.json({ summary: "Calendario de Ana", items: [] });
+    });
+
+    const out = await googleConnector.testConnection(creds);
+    expect(out).toEqual({ ok: true, detail: "Calendario de Ana" });
+    // Y que nadie vuelva a pegarle a calendars.get sin darse cuenta.
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => new URL(u).pathname.endsWith("/events"))).toBe(true);
+    expect(
+      urls.some((u) => /\/calendars\/[^/]+$/.test(new URL(u).pathname))
+    ).toBe(false);
+  });
+
+  it("una credencial de verdad rota sigue reportando error, no falso positivo", async () => {
+    fetchMock.mockImplementation(async () =>
+      Response.json({ error: "invalid_grant" }, { status: 400 })
+    );
+    const out = await googleConnector.testConnection(creds);
+    expect(out.ok).toBe(false);
+  });
+
   it("un refresh token revocado es error de AUTENTICACIÓN y lo explica", async () => {
     fetchMock.mockImplementation(async () =>
       Response.json({ error: "invalid_grant" }, { status: 400 })

@@ -220,11 +220,21 @@ export const googleConnector: AgendaConnector<GoogleCreds> = {
 
   async testConnection(creds): Promise<TestConnectionResult> {
     try {
-      const cal = (await googleFetch(
+      // La prueba pega a events.list, NO a calendars.get. Parece equivalente y
+      // no lo es: `calendars.get` exige `calendar` o `calendar.readonly`, que
+      // GOOGLE_SCOPE no pide (y no debe pedir: son scopes restringidos, y
+      // agrandarlos complica la verificación de la app OAuth). Un refresh
+      // token emitido con exactamente `calendar.events` — el que documentamos
+      // — devolvía 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT y el guardado quedaba
+      // bloqueado, aunque esas mismas credenciales podían crear citas sin
+      // problema. La prueba debe ejercer el permiso que el conector USA.
+      const list = (await googleFetch(
         creds,
-        `/calendars/${encodeURIComponent(creds.calendarId)}`
+        eventsPath(creds, "?maxResults=1")
       )) as { summary?: string } | null;
-      return { ok: true, detail: cal?.summary };
+      // events.list trae el título del calendario en `summary`, igual que
+      // calendars.get: el detalle que ve el dueño no cambia.
+      return { ok: true, detail: list?.summary };
     } catch (err) {
       return {
         ok: false,
