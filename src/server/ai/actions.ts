@@ -53,6 +53,23 @@ const baseActions = [
 const agendaActions = [
   z.object({
     action: z.literal("offer_slots"),
+    /**
+     * Incidente 2026-09-20 — el día del que el cliente pidió horarios
+     * (YYYY-MM-DD, zona del negocio). Sin este campo, un cliente que decía
+     * "el miércoles pero no a las 9" recibía EXACTAMENTE los mismos tres
+     * horarios: el modelo no tenía cómo pedir otra cosa.
+     *
+     * Se COPIA del índice "DÍAS CON HORARIOS" que viaja en el contexto; el
+     * modelo no calcula fechas (mismo motivo por el que existe el mapa
+     * `label → startUtc`).
+     *
+     * El esquema NO valida el formato a propósito: `resolveRequestedDay` en
+     * el motor ignora lo que no parezca una fecha y ofrece el menú normal. Un
+     * regex aquí tiraría la acción entera por un campo opcional mal escrito,
+     * gastaría los 3 reintentos de chatJson y podría acabar escalando — que
+     * sería reproducir el incidente por otra vía.
+     */
+    day: z.string().optional(),
     reply: z.string().optional(),
   }),
   z.object({

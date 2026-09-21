@@ -21,11 +21,13 @@ const chatJson = vi.fn();
 vi.mock("@/lib/ai", () => ({ chatJson }));
 
 const readAgendaState = vi.fn();
+const readBusinessHours = vi.fn();
 const offerSlots = vi.fn();
 const bookSlot = vi.fn();
 const recordRescheduleRequest = vi.fn();
 vi.mock("@/server/agenda/agent", () => ({
   readAgendaState,
+  readBusinessHours,
   offerSlots,
   bookSlot,
   recordRescheduleRequest,
@@ -152,10 +154,18 @@ function queueTurn(
   );
 }
 
-/** El system prompt REAL que salió hacia el proveedor. */
+/** TODO el contexto `system` que salió hacia el proveedor. */
 function systemPrompt(): string {
   const messages = chatJson.mock.calls[0]![1] as ChatMessage[];
-  return messages[0]!.content as string;
+  return messages
+    .filter((m) => m.role === "system")
+    .map((m) => m.content as string)
+    .join("\n");
+}
+
+/** Los mensajes tal cual, para afirmar POSICIONES. */
+function enviados(): ChatMessage[] {
+  return chatJson.mock.calls[0]![1] as ChatMessage[];
 }
 
 describe("runAgentTurn — el estado real de citas llega al prompt", () => {
@@ -168,6 +178,10 @@ describe("runAgentTurn — el estado real de citas llega al prompt", () => {
     });
     readAgendaState.mockReset();
     readAgendaState.mockResolvedValue({ kind: "none" });
+    readBusinessHours.mockReset();
+    readBusinessHours.mockResolvedValue(undefined);
+    offerSlots.mockReset();
+    offerSlots.mockResolvedValue({ ok: true, status: "offered", text: "horarios" });
     sendText.mockReset();
     sendText.mockResolvedValue({ messageId: "wam_1" });
     selectQueue.length = 0;
@@ -245,6 +259,59 @@ describe("runAgentTurn — el estado real de citas llega al prompt", () => {
     expect(systemPrompt()).toContain("no afirmes NINGUNA cita");
     expect(sendText).toHaveBeenCalledTimes(1);
     expect(updates.some((u) => u.set.handoffReason !== undefined)).toBe(false);
+  });
+
+  it("el estado de agenda va DESPUÉS del historial, no enterrado al principio", async () => {
+    // Incidente 2026-09-20: el catálogo con el miércoles 10:00 y 11:00 estaba
+    // en el contexto, pero sepultado bajo 20 mensajes de conversación.
+    readAgendaState.mockResolvedValue({ kind: "none" });
+    queueTurn(CONVERSATION, HISTORIAL_DEL_INCIDENTE);
+
+    const { runAgentTurn } = await import("@/server/ai/pipeline");
+    await runAgentTurn("cv_1");
+
+    const msgs = enviados();
+    const ultimo = msgs[msgs.length - 1]!;
+    expect(ultimo.role).toBe("system");
+    // Se compara la CABECERA del bloque: la frase "ESTADO DE AGENDA" suelta
+    // también aparece en las reglas del prompt estable, que sí van primero.
+    const cabecera = "ESTADO DE AGENDA DE ESTE CONTACTO (dato del sistema";
+    expect(ultimo.content as string).toContain(cabecera);
+    expect(msgs[0]!.content as string).not.toContain(cabecera);
+  });
+
+  it("el `day` que pide el modelo LLEGA al motor", async () => {
+    // Incidente 2026-09-20: el pipeline solo pasaba `intro`, así que el motor
+    // nunca se enteraba de qué día había pedido el cliente y devolvía lo mismo.
+    chatJson.mockResolvedValue({
+      ok: true,
+      data: { action: "offer_slots", day: "2026-09-23", reply: "Claro:" },
+      raw: "{}",
+    });
+    queueTurn();
+
+    const { runAgentTurn } = await import("@/server/ai/pipeline");
+    await runAgentTurn("cv_1");
+
+    expect(offerSlots).toHaveBeenCalledWith(
+      expect.objectContaining({ day: "2026-09-23" })
+    );
+  });
+
+  it("sin `day`, el pipeline NO se inventa uno", async () => {
+    chatJson.mockResolvedValue({
+      ok: true,
+      data: { action: "offer_slots", reply: "Claro:" },
+      raw: "{}",
+    });
+    queueTurn();
+
+    const { runAgentTurn } = await import("@/server/ai/pipeline");
+    await runAgentTurn("cv_1");
+
+    expect(offerSlots).toHaveBeenCalledWith(
+      expect.objectContaining({ day: undefined })
+    );
   });
 
   it("con la agenda APAGADA no se paga la query ni se gasta el token", async () => {

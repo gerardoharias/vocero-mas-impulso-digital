@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildAgendaNowMessage,
   buildAgentSystemPrompt,
   buildJudgePrompt,
   PROMPT_LEAK_MARKERS,
@@ -45,25 +46,23 @@ describe("buildAgentSystemPrompt — agenda (015)", () => {
   });
 
   it("con oferta vigente, expone el startUtc EXACTO para que book_slot no lo adivine", () => {
-    // Este es el bug reportado 2026-09-16: sin este bloque, el modelo solo ve
-    // la etiqueta humana que él mismo mandó ("mié 16 sep, 09:00") y tiene que
-    // adivinar el instante UTC — findOffered exige el epoch exacto, así que
-    // adivinar casi nunca coincide y book_slot se rechaza en loop infinito.
+    // Este bloque se mudó al mensaje de estado que va DESPUÉS del historial.
+    const msg = buildAgendaNowMessage({
+      agenda: true,
+      offers: [{ startUtc: "2026-09-16T15:00:00.000Z", label: "mié 16 sep, 09:00" }],
+    });
+    expect(msg).toContain("→ startUtc:");
+    expect(msg).toContain("2026-09-16T15:00:00.000Z");
+    expect(msg).toContain("mié 16 sep, 09:00");
+  });
+
+  it("la regla de copiar el startUtc sigue en el prompt estable", () => {
     const prompt = buildAgentSystemPrompt({
       profile,
       kb: [],
       stages: [],
       agenda: true,
-      offers: [
-        { startUtc: "2026-09-16T15:00:00.000Z", label: "mié 16 sep, 09:00" },
-        { startUtc: "2026-09-16T15:30:00.000Z", label: "mié 16 sep, 09:30" },
-      ],
     });
-    expect(prompt).toContain("Horarios vigentes");
-    expect(prompt).toContain("mié 16 sep, 09:00");
-    expect(prompt).toContain("2026-09-16T15:00:00.000Z");
-    expect(prompt).toContain("mié 16 sep, 09:30");
-    expect(prompt).toContain("2026-09-16T15:30:00.000Z");
     expect(prompt).toMatch(/COPIA TAL CUAL/);
   });
 });
@@ -113,15 +112,8 @@ describe("contrato de salida y marcadores de fuga", () => {
  */
 describe("ESTADO DE AGENDA — el bloque que le da al modelo la verdad", () => {
   const conAgenda = (
-    agendaState?: Parameters<typeof buildAgentSystemPrompt>[0]["agendaState"]
-  ) =>
-    buildAgentSystemPrompt({
-      profile,
-      kb: [],
-      stages: [{ name: "Nuevo" }],
-      agenda: true,
-      agendaState,
-    });
+    agendaState?: Parameters<typeof buildAgendaNowMessage>[0]["agendaState"]
+  ) => buildAgendaNowMessage({ agenda: true, agendaState }) ?? "";
 
   it("con cita vigente, expone la etiqueta humana Y el startUtc exacto", () => {
     const prompt = conAgenda({
@@ -162,29 +154,106 @@ describe("ESTADO DE AGENDA — el bloque que le da al modelo la verdad", () => {
     );
   });
 
-  it("sin agenda no gasta ni un token en el bloque", () => {
-    const prompt = buildAgentSystemPrompt({
-      profile,
-      kb: [],
-      stages: [],
-      agenda: false,
-      agendaState: { kind: "none" },
+  it("sin agenda no gasta ni un token: el mensaje ni se emite", () => {
+    expect(
+      buildAgendaNowMessage({ agenda: false, agendaState: { kind: "none" } })
+    ).toBeNull();
+  });
+
+  it("expone el índice de DÍAS para que el modelo pueda pedir otro sin calcular fechas", () => {
+    // Incidente 2026-09-20: sin este índice, pedir "el miércoles" obligaba al
+    // modelo a derivar la fecha, que es justo lo que no sabe hacer.
+    const msg = buildAgendaNowMessage({
+      agenda: true,
+      offers: [{ startUtc: "2026-09-23T15:00:00.000Z", label: "mié 23 sep, 09:00" }],
+      offerDays: [{ day: "2026-09-23", label: "miércoles 23 de septiembre" }],
     });
-    expect(prompt).not.toContain("ESTADO DE AGENDA");
+    expect(msg).toContain("DÍAS CON HORARIOS DISPONIBLES");
+    expect(msg).toContain('→ day: "2026-09-23"');
   });
 
   it("ya no queda la regla que le ordenaba ignorar el estado real", () => {
+    const prompt = buildAgentSystemPrompt({
+      profile,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+      agenda: true,
+    });
     // La redacción vieja decía "nunca asumas que la cita anterior quedó
     // cancelada o movida". Con el bloque nuevo eso es una contradicción
     // DENTRO del mismo prompt, y el modelo la resuelve a favor de la
     // instrucción en vez del dato. Si alguien la revierte, este test lo caza.
-    const prompt = conAgenda({ kind: "none" });
     expect(prompt).not.toContain(
       "nunca asumas que la cita anterior quedó cancelada"
     );
     // …pero la mitad útil (no anunciar tú el cambio) sigue viva.
     expect(prompt).toContain("request_reschedule");
     expect(prompt).toContain("nunca anuncies TÚ que la cita quedó movida");
+  });
+});
+
+/**
+ * Incidente 2026-09-20 — el agente afirmó "las demostraciones las tenemos en
+ * horario de mañana". No salía de ninguna configuración: lo dedujo de que los
+ * tres huecos que vio eran a las 09:00.
+ */
+describe("HORARIO DE ATENCIÓN — el modelo deja de inferirlo de una muestra", () => {
+  const horas = {
+    lines: ["Lunes a viernes: 09:00–18:00"],
+    closed: "sábado y domingo",
+    timezone: "America/Mexico_City",
+    today: "domingo 20 de septiembre",
+    lastBookable: "domingo 27 de septiembre",
+  };
+
+  it("expone el horario real, los días cerrados y el ancla de HOY", () => {
+    const prompt = buildAgentSystemPrompt({
+      profile,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+      agenda: true,
+      businessHours: horas,
+    });
+    expect(prompt).toContain("HORARIO DE ATENCIÓN");
+    expect(prompt).toContain("09:00–18:00");
+    expect(prompt).toContain("sábado y domingo");
+    // El prompt no tenía NINGUNA ancla temporal antes de esto.
+    expect(prompt).toContain("Hoy es domingo 20 de septiembre");
+  });
+
+  it("sin el dato no se inventa el bloque", () => {
+    const prompt = buildAgentSystemPrompt({
+      profile,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+      agenda: true,
+    });
+    expect(prompt).not.toContain("HORARIO DE ATENCIÓN");
+  });
+
+  it("con la agenda apagada no gasta ni un token en ello", () => {
+    const prompt = buildAgentSystemPrompt({
+      profile,
+      kb: [],
+      stages: [],
+      agenda: false,
+      businessHours: horas,
+    });
+    expect(prompt).not.toContain("HORARIO DE ATENCIÓN");
+  });
+
+  it("la regla de pedir OTRO DÍA existe y nombra el campo", () => {
+    // Si alguien la borra, el modelo vuelve a llamar offer_slots a secas y el
+    // cliente recibe otra vez los mismos horarios.
+    const prompt = buildAgentSystemPrompt({
+      profile,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+      agenda: true,
+    });
+    expect(prompt).toContain("`day`");
+    expect(prompt).toContain("EXACTAMENTE los mismos horarios");
+    expect(prompt).toContain("NO filtres tú por hora");
   });
 });
 

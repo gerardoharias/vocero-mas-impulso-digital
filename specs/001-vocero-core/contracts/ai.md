@@ -42,6 +42,20 @@ const AgentAction = z.discriminatedUnion('action', [
   (global + conversación + sin handoff). Debounce (coalesce) 6s producción / 0 en
   Laboratorio; lock in-process por `conversation_id`; los mensajes que llegan durante el
   turno se re-encolan.
+- `offer_slots` acepta un `day` opcional (YYYY-MM-DD): con él el motor devuelve
+  varias HORAS de ese día (`pickWithinDay`), sin él el menú normal de varios
+  días (`pickAcrossDays`). Sin ese campo, un cliente que pedía otro día recibía
+  EXACTAMENTE los mismos horarios. El día que no dé nada responde
+  `day_unavailable` con la fecha real y la alternativa más cercana — nunca
+  escala. El esquema no valida el formato: `resolveRequestedDay` ignora lo que
+  no sea una fecha y ofrece el menú normal.
+- El prompt lleva el HORARIO DE ATENCIÓN configurado y la fecha de hoy. Sin
+  eso, el modelo dedujo una restricción inexistente ("solo atendemos por la
+  mañana") de una muestra de tres huecos.
+- El estado volátil (citas vigentes, catálogo de huecos, índice de días) viaja
+  en un mensaje `system` DESPUÉS del historial, no dentro del system prompt:
+  es lo único que cambia entre turnos y lo único que debe ganarle a lo que el
+  agente dijo veinte mensajes atrás.
 - Con la agenda encendida, el prompt lleva el bloque ESTADO DE AGENDA: las
   citas vigentes del contacto leídas de la base al armar el turno
   (`server/agenda/agent.ts` → `readAgendaState`), o la afirmación explícita de

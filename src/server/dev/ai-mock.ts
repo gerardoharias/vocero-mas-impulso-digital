@@ -36,9 +36,14 @@ export function aiMockCompletion(messages: InMessage[]): string {
     return JSON.stringify({ text: "transcripción de prueba de la nota de voz" });
   }
 
-  const system = flattenContent(
-    messages.find((m) => m.role === "system")?.content ?? ""
-  );
+  // TODOS los mensajes system, no solo el primero: desde 2026-09-20 el estado
+  // de agenda (catálogo de huecos, índice de días, citas vigentes) viaja en un
+  // system al FINAL, después del historial. Quedarse con `find` perdería el
+  // catálogo y rompería las ramas de book_slot y estado-cita sin decir por qué.
+  const system = messages
+    .filter((m) => m.role === "system")
+    .map((m) => flattenContent(m.content))
+    .join("\n");
   const lastUser = flattenContent(lastUserMsg?.content ?? "");
 
   // Juez del Laboratorio: veredicto determinista por persona. Para cerrar el
@@ -137,6 +142,42 @@ export function aiMockCompletion(messages: InMessage[]): string {
       text: vigente
         ? `Te recuerdo que tienes tu cita el ${vigente[1]}.`
         : "No tienes ninguna cita vigente conmigo.",
+    });
+  }
+
+  // Incidente 2026-09-20 — "el miércoles, pero no a las 9" y el agente repitió
+  // LOS MISMOS TRES horarios: offer_slots no tenía cómo decir "miércoles".
+  // El día NO va hardcodeado: sale del índice que viaja en el contexto
+  // (bloque DÍAS CON HORARIOS). Si ese índice no llega, el mock lo DICE y el
+  // check del self-test se pone rojo en vez de pasar en vacío.
+  if (/^otro-dia:/i.test(lastUser)) {
+    const dias = [
+      ...new Set(
+        [...system.matchAll(/→ day: "(\d{4}-\d{2}-\d{2})"/g)].map((m) => m[1]!)
+      ),
+    ];
+    // El SEGUNDO día ofrecido: determinista y distinto del primero que ya vio.
+    const day = dias[1] ?? dias[0];
+    return JSON.stringify(
+      day
+        ? {
+            action: "offer_slots",
+            day,
+            reply: "Claro, te paso lo que tengo ese día:",
+          }
+        : { action: "reply", text: "NO-RECIBI-DIAS-EN-EL-CONTEXTO" }
+    );
+  }
+
+  // Su gemelo para el camino infeliz: el guion pasa un día concreto y una
+  // intro OPTIMISTA a propósito, para comprobar que el motor la descarta
+  // cuando ese día no tiene nada.
+  const diaExacto = lastUser.match(/^dia-exacto:\s*(\d{4}-\d{2}-\d{2})/i);
+  if (diaExacto) {
+    return JSON.stringify({
+      action: "offer_slots",
+      day: diaExacto[1],
+      reply: "¡Claro! Aquí tienes los horarios de ese día:",
     });
   }
 
