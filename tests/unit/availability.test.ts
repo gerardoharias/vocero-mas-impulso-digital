@@ -8,7 +8,13 @@ import {
   normalizeWeeklyHours,
   type CalendarSettings,
 } from "@/server/agenda/settings";
-import { daysWithAgenda, pickAcrossDays, spreadByDay } from "@/server/agenda/spread";
+import {
+  daysWithAgenda,
+  pickAcrossDays,
+  pickWithinDay,
+  slotsOnDay,
+  spreadByDay,
+} from "@/server/agenda/spread";
 
 /** 015 — El motor: horario − ocupado, con aviso mínimo. Sin BD ni reloj real. */
 
@@ -261,6 +267,66 @@ describe("pickAcrossDays", () => {
 
   it("count <= 0 no devuelve nada", () => {
     expect(pickAcrossDays(catalogo, 0)).toEqual([]);
+  });
+});
+
+/**
+ * Incidente 2026-09-20: el agente ofreció lunes/martes/miércoles a las 09:00,
+ * el cliente pidió "el miércoles pero no a las 9", y volvió a recibir los
+ * MISMOS tres. `offer_slots` no tenía cómo pedir un día, y el motor no tenía
+ * cómo repartir horas DENTRO de un día.
+ */
+describe("slotsOnDay", () => {
+  it("la frontera es la hora de pared del negocio, no el prefijo del ISO", () => {
+    // 19:00 en México (UTC-6) es T01:00Z del día SIGUIENTE: un
+    // `startUtc.slice(0, 10)` lo asignaría al día equivocado.
+    const nocturno = { startUtc: "2026-08-06T01:00:00.000Z" }; // mié 5, 19:00 MX
+    const temprano = { startUtc: "2026-08-06T15:00:00.000Z" }; // jue 6, 09:00 MX
+    const out = slotsOnDay([nocturno, temprano], "2026-08-05", MX);
+    expect(out).toEqual([nocturno]);
+  });
+
+  it("un día sin huecos devuelve vacío en vez de fallar", () => {
+    expect(slotsOnDay([{ startUtc: "2026-08-06T15:00:00.000Z" }], "2026-08-05", MX))
+      .toEqual([]);
+    expect(slotsOnDay([], "2026-08-05", MX)).toEqual([]);
+  });
+});
+
+describe("pickWithinDay", () => {
+  const now = new Date("2026-08-05T14:00:00.000Z");
+  // Un día completo: 09:00-18:00 cada 30 min ⇒ 18 huecos.
+  const unDia = spreadByDay(
+    filterFreeSlots(
+      buildCandidateSlots(settings(), "2026-08-05", "2026-08-05"),
+      [],
+      { now, minNoticeHours: 0, timezone: MX }
+    ),
+    { timezone: MX, limit: 100, perDay: 100, now }
+  );
+
+  it("reparte a lo largo de la jornada, no los tres primeros", () => {
+    // El caso del incidente: alguien que dijo "por la mañana no puedo" no
+    // puede recibir 09:00, 09:30 y 10:00.
+    expect(unDia.length).toBeGreaterThan(10);
+    const shown = pickWithinDay(unDia, 3);
+    expect(shown).toHaveLength(3);
+    expect(new Set(shown.map((s) => s.dayIso)).size).toBe(1);
+    expect(new Set(shown.map((s) => s.time)).size).toBe(3);
+    // El primero es el más temprano y el último, el más tardío del día.
+    expect(shown[0]!.time).toBe(unDia[0]!.time);
+    expect(shown[2]!.time).toBe(unDia[unDia.length - 1]!.time);
+    // Y hay algo después del mediodía, que es lo que el cliente pedía.
+    expect(shown.some((s) => Number(s.time.slice(0, 2)) >= 12)).toBe(true);
+  });
+
+  it("con menos huecos que `count`, los devuelve todos sin inventar", () => {
+    expect(pickWithinDay(unDia.slice(0, 2), 3)).toHaveLength(2);
+    expect(pickWithinDay([], 3)).toEqual([]);
+  });
+
+  it("count <= 0 no devuelve nada", () => {
+    expect(pickWithinDay(unDia, 0)).toEqual([]);
   });
 });
 

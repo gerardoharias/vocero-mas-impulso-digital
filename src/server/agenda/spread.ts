@@ -1,4 +1,10 @@
-import { dayIsoInTz, dayLabelInTz, timeInTz } from "@/lib/time/slots";
+import {
+  addDaysISO,
+  dayIsoInTz,
+  dayLabelInTz,
+  timeInTz,
+  zonedWallClockToUtc,
+} from "@/lib/time/slots";
 import type { AvailableSlot } from "@/server/agenda/availability";
 
 /**
@@ -101,3 +107,56 @@ export function pickAcrossDays(
   }
   return out;
 }
+
+/**
+ * Los huecos que caen en ESE día del negocio.
+ *
+ * La frontera se calcula por hora de pared en la zona del negocio, NUNCA
+ * comparando el prefijo del ISO: un hueco de las 19:00 en México (UTC-6) es
+ * `T01:00Z` del día SIGUIENTE, y uno de las 09:00 en Auckland (UTC+13) es del
+ * ANTERIOR. Un `startUtc.slice(0, 10)` funciona de milagro con L-V 9-18 en
+ * México y corre un día entero en cuanto alguien abre por la tarde-noche o
+ * configura otra zona.
+ */
+export function slotsOnDay<T extends { startUtc: string }>(
+  slots: T[],
+  dayIso: string,
+  timezone: string
+): T[] {
+  const from = zonedWallClockToUtc(dayIso, "00:00", timezone);
+  const to = zonedWallClockToUtc(addDaysISO(dayIso, 1), "00:00", timezone);
+  if (!from || !to) return [];
+  const fromMs = from.getTime();
+  const toMs = to.getTime();
+  return slots.filter((s) => {
+    const t = Date.parse(s.startUtc);
+    return !Number.isNaN(t) && t >= fromMs && t < toMs;
+  });
+}
+
+/**
+ * De los huecos de UN SOLO día, toma `count` REPARTIDOS a lo largo de la
+ * jornada (el primero, el último y los intermedios) en vez de los `count`
+ * primeros.
+ *
+ * Es la contraparte exacta de `pickAcrossDays`, y existe por el mismo tipo de
+ * incidente visto del otro lado: allí la variedad que importa es la de DÍAS;
+ * aquí el cliente YA eligió el día y lo que necesita ver es variedad de HORAS.
+ * Tomar los tres primeros le enseñaría 09:00, 09:30 y 10:00 a alguien que
+ * acaba de decir que por la mañana no puede — que es justo lo que pasó el
+ * 2026-09-20.
+ */
+export function pickWithinDay(
+  daySlots: SpreadSlot[],
+  count: number
+): SpreadSlot[] {
+  if (count <= 0 || daySlots.length === 0) return [];
+  if (daySlots.length <= count) return daySlots;
+  if (count === 1) return [daySlots[0]!];
+  const out: SpreadSlot[] = [];
+  for (let i = 0; i < count; i++) {
+    out.push(daySlots[Math.round((i * (daySlots.length - 1)) / (count - 1))]!);
+  }
+  return out;
+}
+

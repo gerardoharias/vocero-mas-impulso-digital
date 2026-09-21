@@ -137,3 +137,35 @@ manual equivalente, con `AGENDA=on` y el agente encendido:
    ✅ **Funciona**. Antes no: la solicitud de cambio quedaba `pending` para
    siempre y `createSessionBooking` rebotaba con `reschedule_pending`, así que
    el agente no podía volver a agendarle nada a ese contacto nunca.
+
+## US-otro-día — pedir horarios de OTRO día deja de repetir los mismos
+
+Incidente del 2026-09-20: el agente ofreció lunes 21, martes 22 y miércoles 23,
+los tres a las 09:00. El prospecto dijo *"Miércoles 23 pero no puedo a las 9
+am"* y recibió **exactamente los mismos tres**. Insistió con *"puedo por las
+tardes después de las 6"*, el agente se inventó que *"las demostraciones las
+tenemos en horario de mañana"* y escaló. Lead perdido.
+
+Causa: `offer_slots` no tenía parámetros, así que el modelo no podía pedir
+"miércoles"; el pipeline solo pasaba la intro; y `offerSlots` no filtraba.
+
+Automatizado en `scripts/e2e-selftest.mjs`, dentro de `agendaChecks()`. Guion
+manual equivalente, con `AGENDA=on` y el agente encendido:
+
+1. "Quiero agendar una cita" → llegan horarios de varios días.
+2. `otro-dia: el miércoles, pero no a las 9 am`.
+   ✅ **Control positivo**: el índice de días llegó al modelo (si no, el mock
+   responde `NO-RECIBI-DIAS-EN-EL-CONTEXTO` y el resto de checks sería vacío).
+   ✅ La segunda oferta **no** es idéntica a la primera.
+   ✅ Trae varias horas del **mismo** día, repartidas por la jornada.
+   ✅ No repite las tres horas que el cliente acababa de descartar.
+3. `dia-exacto: <un domingo, con sábado y domingo cerrados>`.
+   ✅ Lo dice con claridad y ofrece alternativas reales.
+   ✅ **Sin** pegar encima la intro optimista del modelo ("¡Claro! Aquí tienes
+   los horarios de ese día") — bug latente que se arregló aquí: el motor la
+   descarta cuando no hay nada que listar.
+   ✅ **Sin escalar** a un humano.
+4. En ningún mensaje aparece una restricción de horario inventada.
+
+Verificado con mutante: apagando el filtro por día, los pasos 2 y 3 se ponen
+rojos y la segunda oferta vuelve a salir byte a byte igual que la primera.

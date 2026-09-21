@@ -1782,6 +1782,109 @@ async function agendaChecks() {
   );
 
   console.log(
+    "\n== Incidente 2026-09-20: pedir OTRO DÍA deja de repetir los mismos tres =="
+  );
+  // El agente ofreció lunes/martes/miércoles a las 09:00, el prospecto pidió
+  // "el miércoles pero no a las 9 am" y recibió LOS MISMOS TRES. `offer_slots`
+  // no tenía cómo decir "miércoles" y el motor no tenía cómo filtrar.
+  const LEAD_DIA = `52146${RUN}08`;
+  const LEAD_DIA_NORM = LEAD_DIA.replace(/^521/, "52");
+  const NOMBRE_DIA = `Lead otro día ${RUN}`;
+
+  async function turnoDia(texto, n) {
+    await api("/api/dev/wa-mock/inbound", {
+      method: "POST",
+      body: JSON.stringify({
+        phoneNumberId: PN,
+        from: LEAD_DIA,
+        name: NOMBRE_DIA,
+        text: texto,
+        waMessageId: `wamid.e2e.otrodia.${RUN}.${n}`,
+      }),
+    });
+    await sleep(coalesceMs + 3000);
+    const outbox = (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
+    const ultimo = outbox.filter((o) => o.to === LEAD_DIA_NORM).pop();
+    return ultimo?.body?.text?.body ?? "";
+  }
+  const bullets = (t) => t.split("\n").filter((l) => l.startsWith("• "));
+  const diaDe = (linea) => linea.split(" a las ")[0];
+  const horaDe = (linea) => linea.split(" a las ")[1] ?? "";
+
+  const oferta1 = await turnoDia("quiero agendar una cita", 1);
+  const b1 = bullets(oferta1);
+  ok(
+    "la primera oferta cubre varios días",
+    new Set(b1.map(diaDe)).size > 1,
+    oferta1
+  );
+
+  const oferta2 = await turnoDia("otro-dia: el miércoles, pero no a las 9 am", 2);
+  const b2 = bullets(oferta2);
+
+  // CONTROL POSITIVO: sin el índice de días en el contexto, el resto de los
+  // checks pasarían en vacío.
+  ok(
+    "CONTROL: el índice de DÍAS llegó al modelo",
+    !oferta2.includes("NO-RECIBI-DIAS"),
+    oferta2
+  );
+  ok(
+    "la segunda oferta NO es idéntica a la primera",
+    b2.length > 0 && b2.join("|") !== b1.join("|"),
+    `1=${b1.join("|")} 2=${b2.join("|")}`
+  );
+  ok(
+    "trae varias horas del MISMO día",
+    b2.length >= 2 && new Set(b2.map(diaDe)).size === 1,
+    oferta2
+  );
+  ok(
+    "no repite las tres horas que el cliente acababa de descartar",
+    b2.filter((l) => b1.map(horaDe).includes(horaDe(l))).length < 3,
+    `${b1.map(horaDe)} vs ${b2.map(horaDe)}`
+  );
+
+  // Camino infeliz: un día que el negocio tiene CERRADO.
+  const ajustes = (await api("/api/calendar/settings")).json?.settings ?? {};
+  const horarioPrevio = ajustes.weeklyHours;
+  await api("/api/calendar/settings", {
+    method: "PUT",
+    body: JSON.stringify({ weeklyHours: { ...horarioPrevio, sun: [], sat: [] } }),
+  });
+  // El próximo domingo, en ISO.
+  const hoy = new Date();
+  const domingo = new Date(hoy);
+  domingo.setDate(hoy.getDate() + ((7 - hoy.getDay()) % 7 || 7));
+  const domingoIso = domingo.toISOString().slice(0, 10);
+
+  const cerrado = await turnoDia(`dia-exacto: ${domingoIso}`, 3);
+  ok(
+    "un día sin agenda se dice con claridad y con alternativas reales",
+    bullets(cerrado).length >= 1,
+    cerrado
+  );
+  ok(
+    "…sin pegar encima la intro optimista del modelo",
+    !/aquí tienes los horarios de ese día/i.test(cerrado),
+    cerrado
+  );
+  const convDia = ((await api("/api/conversations")).json?.conversations ?? []).find(
+    (c) => c.contact.phone === LEAD_DIA_NORM
+  );
+  ok("…y sin escalar a un humano por eso", !convDia?.handoffAt, JSON.stringify(convDia?.handoffReason));
+  ok(
+    "el agente no inventa una restricción de horario",
+    !/horario de (la )?ma(ñ|n)ana/i.test(oferta2 + cerrado),
+    oferta2 + cerrado
+  );
+
+  await api("/api/calendar/settings", {
+    method: "PUT",
+    body: JSON.stringify({ weeklyHours: horarioPrevio }),
+  });
+
+  console.log(
     "\n== Incidente 2026-09-19: una cita CANCELADA en el CRM deja de existir para el agente =="
   );
   // El dueño agendó una demo con el agente, la canceló desde la pantalla de

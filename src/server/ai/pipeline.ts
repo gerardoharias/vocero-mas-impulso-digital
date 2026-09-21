@@ -16,16 +16,20 @@ import {
   type AgentActionType,
 } from "@/server/ai/actions";
 import { matchesHandoffIntent } from "@/server/ai/handoff";
-import { buildAgentSystemPrompt } from "@/server/ai/prompts";
+import {
+  buildAgendaNowMessage,
+  buildAgentSystemPrompt,
+} from "@/server/ai/prompts";
 import { salvageProse } from "@/server/ai/salvage";
 import { agendaEnabled } from "@/server/agenda/flag";
 import {
   bookSlot,
   offerSlots,
   readAgendaState,
+  readBusinessHours,
   recordRescheduleRequest,
 } from "@/server/agenda/agent";
-import { getOffers } from "@/server/agenda/offers";
+import { getOffers, offerDays } from "@/server/agenda/offers";
 import { awaitMediaJob } from "@/server/whatsapp/media";
 import { recordAiNote } from "@/server/contacts/notes";
 
@@ -315,7 +319,7 @@ export async function runAgentTurn(
   // propósito), así que sin la lista real el agendado nunca cierra.
   // En paralelo: son dos lecturas independientes y en serie alargarían el
   // turno sin motivo.
-  const [offers, agendaState] = agenda
+  const [offers, agendaState, businessHours] = agenda
     ? await Promise.all([
         getOffers(organizationId, conversationId),
         // El estado REAL de citas. Sin esto el modelo no tenía ninguna fuente
@@ -328,8 +332,19 @@ export async function runAgentTurn(
           contactId: conversation.contactId,
           isTest: conversation.isTest,
         }),
+        // Incidente 2026-09-20: sin el horario configurado, el modelo se
+        // inventó una restricción ("solo atendemos por la mañana").
+        readBusinessHours(organizationId),
       ])
-    : [[], undefined];
+    : [[], undefined, undefined];
+  const agendaNow = buildAgendaNowMessage({
+    agenda,
+    agendaState,
+    offers,
+    offerDays: businessHours
+      ? offerDays(offers, businessHours.timezone, new Date())
+      : undefined,
+  });
   const messages: ChatMessage[] = [
     {
       role: "system",
@@ -338,11 +353,14 @@ export async function runAgentTurn(
         kb,
         stages,
         agenda,
-        offers,
-        agendaState,
+        businessHours,
       }),
     },
     ...(await historyAsChatMessages(history)),
+    // El estado de AHORA va DESPUÉS del historial: es lo único que cambia
+    // entre turnos y lo único que tiene que ganarle a lo que el propio agente
+    // dijo veinte mensajes atrás. Ver buildAgendaNowMessage.
+    ...(agendaNow ? [{ role: "system" as const, content: agendaNow }] : []),
   ];
 
   const aiConfig = await resolveAiConfig(organizationId);
@@ -390,6 +408,9 @@ export async function runAgentTurn(
                 organizationId,
                 conversationId,
                 intro: action.reply,
+                // Sin esto el motor no se entera de qué día pidió el cliente
+                // y devuelve siempre lo mismo (incidente 2026-09-20).
+                day: action.day,
               })
             : await bookSlot({
                 organizationId,

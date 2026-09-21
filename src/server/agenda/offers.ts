@@ -1,3 +1,4 @@
+import { dayIsoInTz, dayLabelInTz } from "@/lib/time/slots";
 import { asc, eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { newId } from "@/lib/db/ids";
@@ -108,4 +109,24 @@ export function sameInstant(a: string, b: string): boolean {
   const x = Date.parse(a);
   const y = Date.parse(b);
   return !Number.isNaN(x) && !Number.isNaN(y) && x === y;
+}
+
+/**
+ * Los días distintos que cubre la oferta vigente, con su ISO y su etiqueta.
+ *
+ * Es el índice que le permite al modelo PEDIR otro día (`offer_slots.day`)
+ * copiando un valor en vez de calcular una fecha — el mismo motivo por el que
+ * existe el mapa `label → startUtc` para reservar. Incidente 2026-09-20.
+ */
+export function offerDays(
+  offers: { startUtc: string; label: string }[],
+  timezone: string,
+  now: Date
+): { day: string; label: string }[] {
+  const vistos = new Map<string, string>();
+  for (const o of offers) {
+    const day = dayIsoInTz(new Date(o.startUtc), timezone);
+    if (!vistos.has(day)) vistos.set(day, dayLabelInTz(o.startUtc, timezone, now));
+  }
+  return [...vistos.entries()].map(([day, label]) => ({ day, label }));
 }
