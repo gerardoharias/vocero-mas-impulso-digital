@@ -257,3 +257,61 @@ describe("HORARIO DE ATENCIÓN — el modelo deja de inferirlo de una muestra", 
   });
 });
 
+/**
+ * Incidente 2026-09-20 (segundo) — un prospecto preguntó si Vocero se integra
+ * con ERPs, el agente respondió BIEN desde el knowledge base y preguntó qué
+ * sistema usaba. El prospecto contestó "Salesforce" y el agente lo transfirió
+ * a un humano. La cita se escapó estando a un paso.
+ *
+ * El prompt base le daba dos permisos y ningún objetivo: la regla de "fuera
+ * del conocimiento" ofrecía escalar como alternativa de primera opción, y
+ * nada decía que la meta de la conversación fuera dejar una cita agendada.
+ */
+describe("el sesgo a escalar y el objetivo de agendar", () => {
+  const prompt = (agenda: boolean) =>
+    buildAgentSystemPrompt({
+      profile,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+      agenda,
+    });
+
+  it("un hueco en el conocimiento YA NO autoriza traspasar", () => {
+    // La redacción vieja: "…o {handoff} si hace falta una persona".
+    const p = prompt(true);
+    expect(p).not.toContain('o {"action":"handoff",...} si hace falta una persona');
+    expect(p).toContain("TAMPOCO escales por eso");
+  });
+
+  it("la cabecera del knowledge base tampoco ofrece escalar de salida", () => {
+    expect(prompt(true)).not.toContain(
+      "di que lo confirmarás con el equipo o escala"
+    );
+  });
+
+  it("mencionar una herramienta concreta no es motivo de traspaso, y lo dice", () => {
+    // El caso literal del incidente: el prospecto dijo "Salesforce".
+    expect(prompt(true)).toContain("NO es motivo de traspaso");
+  });
+
+  it("con agenda, el agente SABE que su objetivo es dejar una cita agendada", () => {
+    const p = prompt(true);
+    expect(p).toContain("TU OBJETIVO");
+    expect(p).toContain("quede con una cita agendada");
+    // Y el puente explícito: dato concreto del cliente → ofrecer horarios.
+    expect(p).toContain("el siguiente paso natural es offer_slots");
+  });
+
+  it("…pero ofrecer no es insistir", () => {
+    // Sin este contrapeso, el objetivo convierte al agente en un vendedor
+    // pesado que propone agendar en cada turno.
+    expect(prompt(true)).toContain("Ofrecer no es insistir");
+  });
+
+  it("sin agenda no se promete una cita que la instancia no puede dar", () => {
+    const p = prompt(false);
+    expect(p).not.toContain("TU OBJETIVO");
+    expect(p).not.toContain("offer_slots");
+  });
+});
+
