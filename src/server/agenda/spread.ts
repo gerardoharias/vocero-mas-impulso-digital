@@ -2,6 +2,7 @@ import {
   addDaysISO,
   dayIsoInTz,
   dayLabelInTz,
+  labelInTz,
   timeInTz,
   zonedWallClockToUtc,
 } from "@/lib/time/slots";
@@ -25,7 +26,7 @@ export type SpreadSlot = AvailableSlot & {
   dayIso: string;
   /** El día EN PALABRAS: "hoy miércoles 5 de agosto". */
   dayLabel: string;
-  /** Solo la hora: "10:00". */
+  /** Solo la hora, como la lee el prospecto: "10:00 am". */
   time: string;
 };
 
@@ -55,7 +56,12 @@ export function spreadByDay(
         ...slot,
         dayIso,
         dayLabel: dayLabelInTz(slot.startUtc, timezone, now),
-        time: timeInTz(slot.startUtc, timezone),
+        time: timeInTz(slot.startUtc, timezone, { hour12: true }),
+        // La etiqueta heredada de `filterFreeSlots` viene en 24 h porque ahí
+        // la consume el panel. De aquí para adelante todo es del prospecto
+        // (el menú, el catálogo que se persiste, el prompt), así que se
+        // reescribe en el reloj que él lee.
+        label: labelInTz(slot.startUtc, timezone, { hour12: true }),
       });
     }
   }

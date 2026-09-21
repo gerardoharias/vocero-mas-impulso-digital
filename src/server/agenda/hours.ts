@@ -2,6 +2,7 @@ import {
   WEEKDAYS,
   addDaysISO,
   dayLabelInTz,
+  hhmmTo12h,
   todayInTz,
   type WeekdayKey,
 } from "@/lib/time/slots";
@@ -28,7 +29,7 @@ const LABELS: Record<WeekdayKey, string> = {
 };
 
 export type BusinessHours = {
-  /** Una línea por tramo, ya agrupada: "Lunes a viernes: 09:00–18:00". */
+  /** Una línea por tramo, ya agrupada: "Lunes a viernes: 9:00 am–6:00 pm". */
   lines: string[];
   /** Los días cerrados, en palabras. null si abre todos. */
   closed: string | null;
@@ -81,7 +82,7 @@ export function renderWeeklyHours(
       i++;
     }
     const rangos = (settings.weeklyHours[abiertos[inicio]!] ?? [])
-      .map((iv) => `${iv.start}–${iv.end}`)
+      .map((iv) => `${hhmmTo12h(iv.start)}–${hhmmTo12h(iv.end)}`)
       .join(", ");
     const etiqueta =
       inicio === i

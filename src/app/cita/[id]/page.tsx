@@ -42,8 +42,10 @@ export default async function BookingConfirmationPage(ctx: Params) {
   const endIso = new Date(
     booking.scheduledAt.getTime() + booking.durationMinutes * 60_000
   ).toISOString();
-  const start = partsInTz(startIso, booking.timezone);
-  const end = partsInTz(endIso, booking.timezone);
+  // Esta página la abre el prospecto: mismo reloj que el mensaje de WhatsApp
+  // que le mandó el enlace.
+  const start = partsInTz(startIso, booking.timezone, { hour12: true });
+  const end = partsInTz(endIso, booking.timezone, { hour12: true });
   const tzLabel = timezoneLabel(booking.timezone, booking.scheduledAt);
 
   const activa = booking.status === "agendada";

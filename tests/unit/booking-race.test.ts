@@ -185,7 +185,7 @@ describe("la carrera del hueco", () => {
       // Con alternativas concretas: sin ellas, la conversación se queda sin
       // salida y el cliente sin cita.
       expect(err.slots).toHaveLength(2);
-      expect(err.slots[0].label).toBe("mié 5 ago, 09:30");
+      expect(err.slots[0].label).toBe("mié 5 ago, 9:30 am");
     });
 
     // Y quedan REGISTRADAS como la nueva oferta: el cliente puede aceptar una

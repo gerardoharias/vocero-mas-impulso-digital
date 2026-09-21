@@ -1663,6 +1663,16 @@ async function agendaChecks() {
     JSON.stringify(lineasMax)
   );
 
+  // El prospecto lee "9:00 am", no "09:00" — el reloj de 24 h es del panel.
+  // Sin esta aserción el guion pasaba igual con el bug puesto: nada más
+  // miraba el FORMATO de la hora, solo el día.
+  const HORA_12H = /\b\d{1,2}:\d{2} (am|pm)$/;
+  ok(
+    "cada horario ofrecido termina en am/pm",
+    lineasMax.length > 0 && lineasMax.every((l) => HORA_12H.test(l.trim())),
+    JSON.stringify(lineasMax)
+  );
+
   console.log(
     "\n== Auditoría 2026-09-17: el blindaje contra una SEGUNDA cita para el mismo contacto =="
   );
@@ -1701,6 +1711,24 @@ async function agendaChecks() {
     "Max agendó UNA cita real para el prospecto",
     activasMax1.length === 1,
     JSON.stringify(activasMax1.map((b) => b.id))
+  );
+
+  // Ni una sola hora en 24 h en TODA la conversación: el menú, la
+  // confirmación y cualquier recordatorio hablan del mismo reloj. La
+  // confirmación la redacta el modelo (`reply`), así que aquí no se puede
+  // exigir que NOMBRE una hora — lo que sí se exige es que, si la nombra, no
+  // sea "09:00". El reloj de 24 h se queda en el panel.
+  const outboxConfirm = (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
+  const dichosAMax = outboxConfirm
+    .filter((o) => o.to === LEAD_MAX_NORM)
+    .map((o) => o.body?.text?.body ?? "");
+  const conReloj24h = dichosAMax.filter((t) =>
+    /\b\d{1,2}:\d{2}(?!\s*(am|pm))/i.test(t)
+  );
+  ok(
+    "ningún mensaje al prospecto usa el reloj de 24 h",
+    conReloj24h.length === 0,
+    JSON.stringify(conReloj24h)
   );
 
   // El prospecto pide MOVER esa cita: se registra el cambio pendiente y se

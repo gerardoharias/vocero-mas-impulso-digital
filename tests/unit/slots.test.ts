@@ -3,6 +3,7 @@ import {
   dayLabelInTz,
   eachDateInRange,
   expandWorkingDayToUtc,
+  hhmmTo12h,
   isValidTimeZone,
   labelInTz,
   overlaps,
@@ -215,6 +216,63 @@ describe("etiquetas para el cliente", () => {
     expect(timeInTz("no-es-fecha", MX)).toBe("");
     expect(dayLabelInTz("no-es-fecha", MX)).toBe("");
     expect(partsInTz("no-es-fecha", MX).time).toBe("");
+    expect(labelInTz("no-es-fecha", MX, { hour12: true })).toBe("");
+    expect(timeInTz("no-es-fecha", MX, { hour12: true })).toBe("");
+  });
+});
+
+/**
+ * El prospecto lee "9:00 am", no "09:00". El reloj de 24 h se queda para el
+ * panel del operador, así que el 12 h es EXPLÍCITO: nadie lo hereda sin
+ * pedirlo.
+ *
+ * Se arma a mano (hora 0-23 → am/pm) en vez de leer el `dayPeriod` del locale
+ * porque `es-MX` devuelve "a. m." con espacio duro y el ICU del contenedor
+ * Alpine ha variado entre versiones. Estos casos son ese contrato.
+ */
+describe("reloj de 12 horas — lo que ve el prospecto", () => {
+  it("sin opciones nada cambia: el panel sigue en 24 h", () => {
+    expect(timeInTz("2026-08-05T15:00:00.000Z", MX)).toBe("09:00");
+    expect(labelInTz("2026-08-05T15:00:00.000Z", MX)).toBe("mié 5 ago, 09:00");
+    expect(partsInTz("2026-08-05T15:00:00.000Z", MX).time).toBe("09:00");
+  });
+
+  it("minúsculas, sin puntos y sin cero a la izquierda", () => {
+    const opts = { hour12: true };
+    expect(timeInTz("2026-08-05T15:00:00.000Z", MX, opts)).toBe("9:00 am");
+    expect(labelInTz("2026-08-05T15:00:00.000Z", MX, opts)).toBe(
+      "mié 5 ago, 9:00 am"
+    );
+    expect(partsInTz("2026-08-05T15:00:00.000Z", MX, opts).time).toBe("9:00 am");
+    // Los minutos SÍ llevan su cero: "9:05 am", nunca "9:5 am".
+    expect(timeInTz("2026-08-05T15:05:00.000Z", MX, opts)).toBe("9:05 am");
+  });
+
+  it("mediodía es 12:00 pm y medianoche 12:00 am, no 0:00", () => {
+    const opts = { hour12: true };
+    // 18:00Z = 12:00 en México (UTC-6).
+    expect(timeInTz("2026-08-05T18:00:00.000Z", MX, opts)).toBe("12:00 pm");
+    // 06:00Z = 00:00 en México.
+    expect(timeInTz("2026-08-05T06:00:00.000Z", MX, opts)).toBe("12:00 am");
+    // Y la tarde no se queda en 24 h.
+    expect(timeInTz("2026-08-05T23:30:00.000Z", MX, opts)).toBe("5:30 pm");
+  });
+
+  it("respeta la zona del negocio, no la del servidor", () => {
+    // Mismo instante: 09:00 en México, 17:00 en Madrid.
+    expect(timeInTz("2026-08-05T15:00:00.000Z", MADRID, { hour12: true })).toBe(
+      "5:00 pm"
+    );
+  });
+
+  it("hhmmTo12h traduce horas de pared, no instantes", () => {
+    expect(hhmmTo12h("09:00")).toBe("9:00 am");
+    expect(hhmmTo12h("18:00")).toBe("6:00 pm");
+    expect(hhmmTo12h("12:30")).toBe("12:30 pm");
+    expect(hhmmTo12h("00:00")).toBe("12:00 am");
+    // Basura entra, basura sale — pero sin lanzar ni inventar una hora.
+    expect(hhmmTo12h("25:00")).toBe("25:00");
+    expect(hhmmTo12h("")).toBe("");
   });
 });
 
