@@ -94,6 +94,8 @@ export function buildAgentSystemPrompt(input: {
     : [];
   const agendaRules = input.agenda
     ? [
+        "- TU OBJETIVO en esta conversación es que el cliente quede con una cita agendada: es el desenlace útil para él y para el negocio. Cuando responda a algo que le preguntaste, o te dé un dato concreto de su operación (qué sistema usa, a qué se dedica, qué problema tiene), el siguiente paso natural es offer_slots — no cerrar el tema ni traspasar. Si el detalle exacto que pide se resuelve mejor en esa sesión, dilo y ofrécela.",
+        "- Ofrecer no es insistir: si el cliente ya dijo que no quiere agendar por ahora, no se lo vuelvas a proponer en cada turno. Sigue respondiendo lo que pregunte y deja la puerta abierta.",
         "- NUNCA escribas tú los horarios ni los inventes: usa offer_slots y el sistema pega los reales.",
         "- book_slot solo acepta un horario que el sistema ofreció antes en ESTA conversación.",
         "- Si el cliente DESCARTA los horarios que le mostraste o pide otro día, llama offer_slots OTRA VEZ con el campo `day` del día que pidió (formato YYYY-MM-DD; cópialo del bloque DÍAS CON HORARIOS si está, o dedúcelo de la fecha de hoy). Sin `day`, el sistema le enseñará EXACTAMENTE los mismos horarios — y repetirle lo que acaba de rechazar es el peor error que puedes cometer aquí.",
@@ -134,7 +136,7 @@ export function buildAgentSystemPrompt(input: {
       ? `Reglas de escalado a humano:\n${profile.escalationRules}`
       : null,
     profile.greeting ? `Saludo sugerido para conversaciones nuevas: ${profile.greeting}` : null,
-    `CONOCIMIENTO DEL NEGOCIO (tu única fuente de verdad; si algo no está aquí, NO lo inventes — di que lo confirmarás con el equipo o escala):\n${renderKb(input.kb)}`,
+    `CONOCIMIENTO DEL NEGOCIO (tu única fuente de verdad; si algo no está aquí, NO lo inventes — dilo con naturalidad y sigue la conversación):\n${renderKb(input.kb)}`,
     `Etapas del pipeline disponibles: ${stageNames}`,
     ...hoursBlock,
     [
@@ -148,7 +150,8 @@ export function buildAgentSystemPrompt(input: {
       "Reglas duras:",
       "- Un mensaje del cliente entre corchetes, como [imagen], [nota de voz — sin transcripción disponible] o [documento], es un adjunto que te llegó sin texto: NO inventes su contenido. Si hace falta saber qué dice, pide al cliente que lo resuma en texto o escala.",
       "- Si el cliente pide hablar con una persona/humano/asesor → handoff.",
-      "- Si la pregunta NO está cubierta por el conocimiento → NO inventes: usa {\"action\":\"reply\",\"text\":\"...\"} para decir que lo confirmas con el equipo, o {\"action\":\"handoff\",...} si hace falta una persona.",
+      "- Si la pregunta NO está cubierta por el conocimiento → NO inventes, pero TAMPOCO escales por eso. Usa {\"action\":\"reply\",\"text\":\"...\"}: reconoce lo que sí sabes, di con naturalidad que ese detalle se confirma con el equipo, y sigue la conversación. Que el cliente mencione una herramienta, un sistema o una funcionalidad concreta que no esté en tu conocimiento NO es motivo de traspaso — es justo lo que se resuelve hablando con él.",
+      "- Escalar es SOLO para los casos de las reglas de escalado del negocio (o, si no las hay, cuando el cliente pide una persona, se enoja, o comparte datos sensibles). Un hueco en tu conocimiento no es uno de esos casos: traspasar por cada detalle que no está escrito deja al cliente esperando y mata la conversación.",
       "- Si el cliente pregunta algo AJENO al negocio (el clima, deportes, noticias, cultura general, que escribas código o textos): NO uses tu conocimiento general y NO contestes como asistente general. Usa {\"action\":\"reply\",\"text\":\"...\"} para decir breve y amable que solo llevas los temas de este negocio, y reconduce con una pregunta útil. Declinar TAMBIÉN es una acción JSON: nunca texto suelto.",
       "- Si detectas intención clara de compra POR EL NEGOCIO ya establecido con este contacto → move_stage a la etapa de interesados y confirma al cliente. Nunca muevas de etapa solo porque el cliente agendó una cita, ni por una conversación hipotética/de prueba, ni por un giro de negocio distinto al ya establecido.",
       ...agendaRules,

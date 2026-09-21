@@ -42,6 +42,16 @@ const AgentAction = z.discriminatedUnion('action', [
   (global + conversación + sin handoff). Debounce (coalesce) 6s producción / 0 en
   Laboratorio; lock in-process por `conversation_id`; los mensajes que llegan durante el
   turno se re-encolan.
+- Un hueco en el knowledge base NO autoriza traspasar: el prompt exige
+  responder con `reply` y seguir la conversación. Escalar queda para las
+  reglas de escalado del negocio (o, sin ellas, petición explícita del
+  cliente, hostilidad o datos sensibles). Que el cliente nombre una
+  herramienta o funcionalidad que no está escrita es justo lo que se resuelve
+  hablando, no traspasando.
+- Con la agenda encendida, el prompt declara el OBJETIVO: dejar una cita
+  agendada. Un dato concreto del cliente (su sistema, su giro, su problema) es
+  la señal de avanzar a `offer_slots`. Con el contrapeso explícito de que
+  ofrecer no es insistir.
 - `offer_slots` acepta un `day` opcional (YYYY-MM-DD): con él el motor devuelve
   varias HORAS de ese día (`pickWithinDay`), sin él el menú normal de varios
   días (`pickAcrossDays`). Sin ese campo, un cliente que pedía otro día recibía
