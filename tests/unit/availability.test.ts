@@ -206,7 +206,9 @@ describe("spreadByDay", () => {
     });
     expect(spread[0]!.dayLabel).toMatch(/^hoy /);
     expect(spread[1]!.dayLabel).toMatch(/^mañana /);
-    expect(spread[0]!.time).toBe("09:00");
+    // Lo que sale de aquí ya es texto para el prospecto: reloj de 12 h.
+    expect(spread[0]!.time).toBe("9:00 am");
+    expect(spread[0]!.label).toBe("mié 5 ago, 9:00 am");
   });
 
   it("sin huecos no inventa días", () => {
@@ -317,7 +319,7 @@ describe("pickWithinDay", () => {
     expect(shown[0]!.time).toBe(unDia[0]!.time);
     expect(shown[2]!.time).toBe(unDia[unDia.length - 1]!.time);
     // Y hay algo después del mediodía, que es lo que el cliente pedía.
-    expect(shown.some((s) => Number(s.time.slice(0, 2)) >= 12)).toBe(true);
+    expect(shown.some((s) => s.time.endsWith("pm"))).toBe(true);
   });
 
   it("con menos huecos que `count`, los devuelve todos sin inventar", () => {

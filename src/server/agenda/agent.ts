@@ -105,7 +105,9 @@ export async function readAgendaState(input: {
         // El MISMO helper que produjo la etiqueta que el cliente ya vio al
         // agendar: si no coincidiera letra por letra, el modelo podría creer
         // que son dos citas distintas.
-        label: labelInTz(b.scheduledAt.toISOString(), settings.timezone),
+        label: labelInTz(b.scheduledAt.toISOString(), settings.timezone, {
+          hour12: true,
+        }),
         startUtc: b.scheduledAt.toISOString(),
       })),
     };

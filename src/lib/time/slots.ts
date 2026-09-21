@@ -213,8 +213,58 @@ export function overlaps(
   );
 }
 
+/**
+ * Opciones de formato de hora. `hour12: true` escribe "9:00 am" — el formato
+ * que lee un prospecto en WhatsApp. Por omisión se conserva el reloj de 24 h,
+ * que es el que usa el panel del operador.
+ */
+export type HourFormat = { hour12?: boolean };
+
+/**
+ * "9:00 am" a partir de una hora de pared 0–23.
+ *
+ * El `dayPeriod` del locale NO sirve: `es-MX` devuelve "a. m." con espacio
+ * duro y el ICU del contenedor Alpine ha variado entre versiones. Se deriva
+ * am/pm de la hora nosotros mismos — misma disciplina que `tzOffsetMinutes`,
+ * que también lee partes a mano en vez de confiar en el formato compuesto.
+ */
+function to12h(hour24: number, minute: number): string {
+  const sufijo = hour24 < 12 ? "am" : "pm";
+  const h = hour24 % 12 === 0 ? 12 : hour24 % 12;
+  return `${h}:${String(minute).padStart(2, "0")} ${sufijo}`;
+}
+
+/** Hora de pared "HH:mm" (un `Interval`, no un instante) → "9:00 am". */
+export function hhmmTo12h(hhmm: string): string {
+  if (!HHMM.test(hhmm)) return hhmm;
+  const [h, m] = hhmm.split(":").map(Number) as [number, number];
+  return to12h(h, m);
+}
+
+/** La hora que marca el reloj de la zona en ese instante, ya formateada. */
+function horaEnTz(d: Date, tz: string, opts?: HourFormat): string {
+  const parts = new Intl.DateTimeFormat("es-MX", {
+    timeZone: tz,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const map: Record<string, string> = {};
+  for (const p of parts) map[p.type] = p.value;
+  // Intl puede devolver "24" a medianoche en algunos entornos.
+  const hh = Number(map.hour) % 24;
+  const mm = Number(map.minute);
+  return opts?.hour12
+    ? to12h(hh, mm)
+    : `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+}
+
 /** Etiqueta legible en la zona del negocio: "mié 5 ago, 10:00". */
-export function labelInTz(startUtc: string, tz: string): string {
+export function labelInTz(
+  startUtc: string,
+  tz: string,
+  opts?: HourFormat
+): string {
   const d = new Date(startUtc);
   if (Number.isNaN(d.getTime())) return "";
   const parts = new Intl.DateTimeFormat("es-MX", {
@@ -222,27 +272,23 @@ export function labelInTz(startUtc: string, tz: string): string {
     weekday: "short",
     day: "numeric",
     month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
   }).formatToParts(d);
   const map: Record<string, string> = {};
   for (const p of parts) map[p.type] = p.value;
   const weekday = (map.weekday ?? "").replace(/\.$/, "");
   const month = (map.month ?? "").replace(/\.$/, "");
-  return `${weekday} ${map.day} ${month}, ${map.hour}:${map.minute}`;
+  return `${weekday} ${map.day} ${month}, ${horaEnTz(d, tz, opts)}`;
 }
 
 /** Solo la hora en la zona del negocio: "10:00". */
-export function timeInTz(startUtc: string, tz: string): string {
+export function timeInTz(
+  startUtc: string,
+  tz: string,
+  opts?: HourFormat
+): string {
   const d = new Date(startUtc);
   if (Number.isNaN(d.getTime())) return "";
-  return new Intl.DateTimeFormat("es-MX", {
-    timeZone: tz,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(d);
+  return horaEnTz(d, tz, opts);
 }
 
 /**
@@ -291,15 +337,16 @@ export function timezoneLabel(tz: string, at: Date): string {
 /** Partes por separado para la tabla de Citas. */
 export function partsInTz(
   startUtc: string,
-  tz: string
+  tz: string,
+  opts?: HourFormat
 ): { date: string; time: string; weekday: string } {
   const d = new Date(startUtc);
   if (Number.isNaN(d.getTime())) return { date: "", time: "", weekday: "" };
-  const fmt = (opts: Intl.DateTimeFormatOptions) =>
-    new Intl.DateTimeFormat("es-MX", { timeZone: tz, ...opts }).format(d);
+  const fmt = (o: Intl.DateTimeFormatOptions) =>
+    new Intl.DateTimeFormat("es-MX", { timeZone: tz, ...o }).format(d);
   return {
     date: fmt({ day: "numeric", month: "short", year: "numeric" }),
-    time: fmt({ hour: "2-digit", minute: "2-digit", hour12: false }),
+    time: horaEnTz(d, tz, opts),
     weekday: fmt({ weekday: "long" }),
   };
 }

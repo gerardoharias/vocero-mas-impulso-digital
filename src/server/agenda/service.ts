@@ -229,7 +229,9 @@ export async function createSessionBooking(input: {
         [],
         {
           bookingId: active.id,
-          label: labelInTz(active.scheduledAt.toISOString(), settings.timezone),
+          label: labelInTz(active.scheduledAt.toISOString(), settings.timezone, {
+            hour12: true,
+          }),
         }
       );
     }
@@ -305,7 +307,11 @@ export async function createSessionBooking(input: {
         active
           ? {
               bookingId: active.id,
-              label: labelInTz(active.scheduledAt.toISOString(), settings.timezone),
+              label: labelInTz(
+                active.scheduledAt.toISOString(),
+                settings.timezone,
+                { hour12: true }
+              ),
             }
           : null
       );
@@ -353,7 +359,7 @@ export async function createSessionBooking(input: {
     booking: delivered,
     meetingLink: delivered.meetingLink,
     linkPending: delivered.linkPending,
-    label: labelInTz(slot.startUtc, settings.timezone),
+    label: labelInTz(slot.startUtc, settings.timezone, { hour12: true }),
   };
 }
 
@@ -462,7 +468,7 @@ export async function rescheduleBooking(input: {
     booking: next,
     meetingLink: next.meetingLink,
     linkPending: next.linkPending,
-    label: labelInTz(slot.startUtc, settings.timezone),
+    label: labelInTz(slot.startUtc, settings.timezone, { hour12: true }),
   };
 }
 
@@ -636,7 +642,9 @@ export async function retryMeetingLink(input: {
     booking: delivered,
     meetingLink: delivered.meetingLink,
     linkPending: delivered.linkPending,
-    label: labelInTz(delivered.scheduledAt.toISOString(), settings.timezone),
+    label: labelInTz(delivered.scheduledAt.toISOString(), settings.timezone, {
+      hour12: true,
+    }),
   };
 }
 
@@ -784,9 +792,16 @@ async function refreshOffer(
     console.warn(`[agenda] no pude calcular alternativas: ${err}`);
     return [];
   }
+  // La etiqueta que trae `computeAvailability` viene en 24 h (ahí la consume
+  // el panel). Esta oferta es EXCLUSIVAMENTE para re-ofrecerle al prospecto,
+  // así que se reescribe en su reloj. Si la zona no se puede leer, la
+  // alternativa en 24 h es mejor que ninguna alternativa.
+  const tz = await getSettings(organizationId)
+    .then((cfg) => cfg.timezone)
+    .catch(() => null);
   const offers: OfferedSlot[] = fresh.map((s) => ({
     startUtc: s.startUtc,
-    label: s.label,
+    label: tz ? labelInTz(s.startUtc, tz, { hour12: true }) : s.label,
   }));
   if (conversationId && offers.length > 0) {
     await replaceOffers(organizationId, conversationId, offers).catch((err) => {
@@ -981,7 +996,9 @@ async function getBookingLabel(
     .limit(1);
   const row = rows[0];
   if (!row) return null;
-  return labelInTz(row.scheduledAt.toISOString(), settings.timezone);
+  return labelInTz(row.scheduledAt.toISOString(), settings.timezone, {
+    hour12: true,
+  });
 }
 
 /** 23505 = unique_violation de Postgres. */
