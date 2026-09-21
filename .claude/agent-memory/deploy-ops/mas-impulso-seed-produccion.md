@@ -19,7 +19,7 @@ node seed-mas-impulso.mjs <organization_id>
 ```
 
 **Cómo aplicar**: ejecutar esto DENTRO del contenedor de producción ya
-levantado (consola/terminal de Coolify) o vía un túnel puntual con
+levantado (la terminal del servicio en EasyPanel) o vía un túnel puntual con
 `DATABASE_URL` de producción que el dueño autorice explícitamente — ver
-[ruta-a-coolify-webhook](ruta-a-coolify-webhook.md). Nunca correr este seed
-contra la `DATABASE_URL` de producción desde este checkout local.
+[produccion-easypanel-vocero](produccion-easypanel-vocero.md). Nunca correr
+este seed contra la `DATABASE_URL` de producción desde este checkout local.

@@ -5,7 +5,5 @@ Vacío al inicio; el subagente lo irá poblando (IDs de la plataforma, modos de
 fallo recurrentes del deploy, comando de migración, healthcheck, etc.).
 -->
 
-- [Ruta A: deploy por webhook de Coolify](ruta-a-coolify-webhook.md) — sin MCP ni SSH desde este checkout, deploy/logs/estado se gestionan vía webhook + dashboard; dominio `crm.masimpulsodigital.com`.
+- [Producción vive en EasyPanel](produccion-easypanel-vocero.md) — proyecto `automation`, servicio `vocero`, dominio `vocero.tobaxis.com`; se despliega e inspecciona con el MCP `easypanel-tobaxis`.
 - [Seed de MÁS Impulso Digital en producción](mas-impulso-seed-produccion.md) — correr `node seed-mas-impulso.mjs <org_id>` dentro del contenedor, nunca desde dev.
-- [/api/health expone el commit](health-expone-commit.md) — `curl` público basta para comparar commit desplegado vs. HEAD local, sin Coolify.
-- [Webhook de Coolify exige Bearer token](webhook-requiere-bearer-token.md) — la URL sola da 401; falta un API token de Coolify que no vive en este checkout.
