@@ -45,10 +45,27 @@ export type CapiMockEvent = {
   at: string;
 };
 
+/**
+ * Una señal de presencia (leído + "escribiendo…") que el CRM le mandó al mock.
+ *
+ * Se registra aparte del outbox a propósito: NO es un mensaje saliente. Existe
+ * para que el self-test pueda AFIRMAR que la señal salió y con qué wamid — sin
+ * esto el mock respondía {success:true} y el arnés no podía comprobar nada.
+ */
+export type TypingMockSignal = {
+  n: number;
+  phoneNumberId: string;
+  messageId: string;
+  /** `typing_indicator.type`, o null si SOLO se marcó leído. */
+  typing: string | null;
+  at: string;
+};
+
 type WaMockState = {
   outbox: OutboxEntry[];
   templates: MockTemplate[];
   capiEvents: CapiMockEvent[];
+  typingSignals: TypingMockSignal[];
   counter: number;
 };
 
@@ -60,6 +77,7 @@ export function getWaMockState(): WaMockState {
       outbox: [],
       templates: [],
       capiEvents: [],
+      typingSignals: [],
       counter: 0,
     };
   }
@@ -71,6 +89,7 @@ export function resetWaMockState(): void {
     outbox: [],
     templates: [],
     capiEvents: [],
+    typingSignals: [],
     counter: 0,
   };
 }

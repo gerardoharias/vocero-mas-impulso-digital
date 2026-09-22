@@ -466,7 +466,10 @@ export async function ingestInboundMessage(input: {
     data: { conversation: { id: conversation.id } },
   });
 
-  await maybeRunAgentTurn(conversation.id);
+  // Se pasa la fila entera y el wamid recién persistido: el trigger necesita
+  // `isTest`/`aiEnabled`/`handoffAt`/`channel` para decidir si señalar
+  // "escribiendo…", y todos ya están en memoria aquí.
+  await maybeRunAgentTurn(conversation, { waMessageId: input.waMessageId });
 }
 
 function toDate(timestamp: string): Date {

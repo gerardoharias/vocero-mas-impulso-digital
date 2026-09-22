@@ -402,6 +402,14 @@ async function main() {
     `antes=${outboxBeforeTyping} después=${outboxAfterTyping}`
   );
 
+  const señalesBot =
+    (await api("/api/dev/wa-mock/typing")).json?.typingSignals ?? [];
+  ok(
+    "…y SÍ deja rastro de la señal en Meta (la delegación no se rompe en silencio)",
+    señalesBot.length > 0 && señalesBot.at(-1)?.typing === "text",
+    JSON.stringify(señalesBot.at(-1))
+  );
+
   const typ404 = await bot("/api/bot/typing", {
     method: "POST",
     body: JSON.stringify({ conversationId: "cv_no_existe" }),
@@ -2022,6 +2030,93 @@ async function agendaChecks() {
   );
 
   console.log(
+    "\n== escribiendo…: el prospecto ve que le están contestando =="
+  );
+  // Hasta el 2026-09-21 el agente in-process no señalaba NADA: ~6 s de
+  // debounce más toda la latencia del modelo en silencio, y luego el mensaje
+  // de golpe. La capacidad existía pero atrapada en un route del bot externo.
+  // `coalesceTyping` se declara más abajo en esta función; aquí se lee aparte.
+  const coalesceTyping = Number(process.env.AGENT_COALESCE_MS ?? 6000);
+  const LEAD_TYPING = `52146${RUN}09`;
+  const LEAD_TYPING_NORM = LEAD_TYPING.replace(/^521/, "52");
+
+  async function señales() {
+    return (await api("/api/dev/wa-mock/typing")).json?.typingSignals ?? [];
+  }
+  /** Espera por CONDICIÓN, nunca por reloj. */
+  async function esperarSeñal(desdeN, limiteMs) {
+    const hasta = Date.now() + limiteMs;
+    while (Date.now() < hasta) {
+      const nuevas = (await señales()).filter((x) => x.n > desdeN);
+      if (nuevas.length > 0) return nuevas;
+      await sleep(400);
+    }
+    return [];
+  }
+
+  const marcaSeñal = (await señales()).at(-1)?.n ?? 0;
+  const wamidTyping = `wamid.e2e.typing.${RUN}.1`;
+  await api("/api/dev/wa-mock/inbound", {
+    method: "POST",
+    body: JSON.stringify({
+      phoneNumberId: PN,
+      from: LEAD_TYPING,
+      name: `Lead typing ${RUN}`,
+      text: "hola, quiero información",
+      waMessageId: wamidTyping,
+    }),
+  });
+
+  // Se mide CUÁNTO tarda, no solo que llegue: el turno también enciende la
+  // señal antes de llamar al modelo, así que sin medir el tiempo este check
+  // pasaría igual con el enganche de la ingesta desactivado — lo verificamos
+  // con un mutante y pasaba en vacío.
+  const t0 = Date.now();
+  const nuevas = await esperarSeñal(marcaSeñal, coalesceTyping + 4000);
+  const tardo = Date.now() - t0;
+  ok(
+    "un mensaje entrante enciende «escribiendo…» al momento",
+    nuevas.length > 0,
+    JSON.stringify(nuevas)
+  );
+  ok(
+    "…sin esperar al debounce: llega desde la INGESTA, no desde el turno",
+    tardo < coalesceTyping - 1500,
+    `tardó ${tardo}ms con un debounce de ${coalesceTyping}ms`
+  );
+  ok(
+    "…sobre el mensaje correcto, y con el indicador (no solo el leído)",
+    nuevas.some((x) => x.messageId === wamidTyping && x.typing === "text"),
+    JSON.stringify(nuevas)
+  );
+
+  // Con la IA pausada atiende una persona: señalar sería mentirle al cliente.
+  const convTyping = ((await api("/api/conversations")).json?.conversations ?? []).find(
+    (c) => c.contact.phone === LEAD_TYPING_NORM
+  );
+  await api(`/api/conversations/${convTyping?.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ aiEnabled: false }),
+  });
+  const marcaPausa = (await señales()).at(-1)?.n ?? 0;
+  await api("/api/dev/wa-mock/inbound", {
+    method: "POST",
+    body: JSON.stringify({
+      phoneNumberId: PN,
+      from: LEAD_TYPING,
+      name: `Lead typing ${RUN}`,
+      text: "sigo por aquí",
+      waMessageId: `wamid.e2e.typing.${RUN}.2`,
+    }),
+  });
+  await sleep(coalesceTyping + 3000);
+  ok(
+    "con la IA pausada NO se enciende: atiende una persona",
+    (await señales()).filter((x) => x.n > marcaPausa).length === 0,
+    JSON.stringify((await señales()).filter((x) => x.n > marcaPausa))
+  );
+
+  console.log(
     "\n== Incidente 2026-09-20: pedir OTRO DÍA deja de repetir los mismos tres =="
   );
   // El agente ofreció lunes/martes/miércoles a las 09:00, el prospecto pidió
@@ -2090,10 +2185,13 @@ async function agendaChecks() {
     method: "PUT",
     body: JSON.stringify({ weeklyHours: { ...horarioPrevio, sun: [], sat: [] } }),
   });
-  // El próximo domingo, en ISO.
+  // El próximo domingo, en ISO. TODO en UTC a propósito: mezclar `getDay()`
+  // (local) con `toISOString()` (UTC) manda la fecha del lunes siguiente en
+  // cuanto hay desfase horario, y el check pasa o falla según la hora a la que
+  // corras el arnés.
   const hoy = new Date();
   const domingo = new Date(hoy);
-  domingo.setDate(hoy.getDate() + ((7 - hoy.getDay()) % 7 || 7));
+  domingo.setUTCDate(hoy.getUTCDate() + ((7 - hoy.getUTCDay()) % 7 || 7));
   const domingoIso = domingo.toISOString().slice(0, 10);
 
   const cerrado = await turnoDia(`dia-exacto: ${domingoIso}`, 3);

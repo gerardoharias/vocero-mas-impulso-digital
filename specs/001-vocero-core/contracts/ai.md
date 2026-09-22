@@ -42,6 +42,14 @@ const AgentAction = z.discriminatedUnion('action', [
   (global + conversación + sin handoff). Debounce (coalesce) 6s producción / 0 en
   Laboratorio; lock in-process por `conversation_id`; los mensajes que llegan durante el
   turno se re-encolan.
+- Presencia: al ingerir un entrante REAL, si el agente va a responder (IA
+  configurada, conversación sin handoff y con IA activa, agente encendido), se
+  marca leído y se enciende "escribiendo…" en UNA sola llamada a Cloud API
+  (`server/whatsapp/presence.ts`). Se re-enciende antes del LLM si la señal ya
+  caducó (~25 s en Meta). Best-effort: nunca se reintenta y jamás tumba el
+  turno. Sandbox del Laboratorio, canal sin soporte, handoff/IA pausada, sin
+  entrante y sin conexión cortan ANTES de tocar la red. Solo WhatsApp declara
+  `typingIndicator` en el catálogo de canales.
 - Un hueco en el knowledge base NO autoriza traspasar: el prompt exige
   responder con `reply` y seguir la conversación. Escalar queda para las
   reglas de escalado del negocio (o, sin ellas, petición explícita del

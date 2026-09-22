@@ -16,6 +16,8 @@ import {
   type AgentActionType,
 } from "@/server/ai/actions";
 import { matchesHandoffIntent } from "@/server/ai/handoff";
+import { conversationAllowsAgent } from "@/server/ai/eligibility";
+import { markReadAndTyping, TYPING_TTL_MS } from "@/server/whatsapp/presence";
 import {
   buildAgendaNowMessage,
   buildAgentSystemPrompt,
@@ -259,7 +261,10 @@ export async function runAgentTurn(
   const organizationId = conversation.organizationId;
 
   // Condiciones de silencio: handoff activo o IA apagada en la conversación.
-  if (conversation.handoffAt || !conversation.aiEnabled) return;
+  // El predicado es compartido con `trigger.ts` a propósito: si divergieran,
+  // el prospecto vería "escribiendo…" en una conversación que atiende una
+  // persona.
+  if (!conversationAllowsAgent(conversation)) return;
 
   const profileRows = await db
     .select()
@@ -362,6 +367,17 @@ export async function runAgentTurn(
     // dijo veinte mensajes atrás. Ver buildAgendaNowMessage.
     ...(agendaNow ? [{ role: "system" as const, content: agendaNow }] : []),
   ];
+
+  // Re-encender "escribiendo…" si la señal de la ingesta ya caducó (el
+  // indicador de Meta expira a los ~25 s). Va AQUÍ y no antes: cada `return`
+  // de más arriba significa que el agente no va a responder, y los puntitos
+  // ahí serían una mentira. El wamid ya está en memoria: cero queries.
+  // La conversación de prueba corta dentro del helper, antes de tocar la red.
+  await markReadAndTyping({
+    conversation,
+    waMessageId: lastInbound.waMessageId,
+    minIntervalMs: TYPING_TTL_MS,
+  });
 
   const aiConfig = await resolveAiConfig(organizationId);
   const result = await chatJson(agentActionSchema(agenda), messages, aiConfig);
