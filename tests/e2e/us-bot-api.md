@@ -130,3 +130,23 @@ CRM no impone un cuestionario.
 39. Con Meta caído (token `...-invalid` en el mock), typing → **200**
     `{ok:false, reason:"meta_error"}`: es best-effort por contrato, al bot
     jamás le vale reintentarlo.
+
+## Presencia desde el agente in-process (2026-09-21)
+
+`POST /api/bot/typing` ya no implementa la lógica: delega en
+`server/whatsapp/presence.ts`, que comparte con el agente in-process. Su
+contrato NO cambia (401 / 409 `no_org` / 400 / 404 / 200 `{ok:true}` / 200
+`{ok:false,reason}` / 409 `no_connection`), y gana un motivo **aditivo**:
+`channel_unsupported`, para conversaciones de Instagram o Messenger — antes
+mandaba un id sintético al número de WhatsApp y Meta lo rechazaba.
+
+El agente in-process enciende la señal **desde la ingesta**, en cuanto llega el
+mensaje, si de verdad va a responder (IA configurada, conversación sin handoff
+y con IA activa, agente encendido en Ajustes). La re-enciende antes de llamar
+al modelo si ya pasaron más de 20 s, porque el indicador de Meta expira a los
+~25 s.
+
+Automatizado en `scripts/e2e-selftest.mjs`. El self-test mide **cuánto tarda**
+la señal, no solo que llegue: el turno también la enciende, así que sin medir
+el tiempo el check pasaría en vacío con el enganche de la ingesta desactivado
+(verificado con mutante: 6411 ms contra un debounce de 6000 ms).

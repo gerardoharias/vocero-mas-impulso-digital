@@ -38,6 +38,19 @@ export type ChannelCapabilities = {
    * — sin esto se queda con el reloj puesto para siempre.
    */
   deliveryReceipts: boolean;
+  /**
+   * ¿Podemos mostrarle al CONTACTO que estamos escribiendo? Es una señal que
+   * emitimos NOSOTROS y que él ve — no confundir con `deliveryReceipts`, que
+   * va en el sentido contrario (si el estado de NUESTRO mensaje vuelve por
+   * webhook).
+   *
+   * `false` en Instagram/Messenger significa "esta instancia no lo emite hoy",
+   * no "la plataforma no lo tiene": Meta expone `sender_action: typing_on`,
+   * pero es OTRA llamada, por otro transporte, y sin la fusión de leído +
+   * escribiendo que sí tiene WhatsApp. Encenderlo es escribir ese adaptador,
+   * no cambiar este booleano.
+   */
+  typingIndicator: boolean;
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -50,6 +63,7 @@ export const CHANNEL_CAPABILITIES: Record<Channel, ChannelCapabilities> = {
     maxTextBytes: null,
     outboundMedia: true,
     deliveryReceipts: true,
+    typingIndicator: true,
   },
   instagram: {
     label: CHANNEL_LABEL.instagram,
@@ -60,6 +74,7 @@ export const CHANNEL_CAPABILITIES: Record<Channel, ChannelCapabilities> = {
     maxTextBytes: 1000,
     outboundMedia: false,
     deliveryReceipts: false,
+    typingIndicator: false,
   },
   // 017: Messenger comparte la plataforma de mensajería de Meta con Instagram
   // (misma ventana de 24 h, misma etiqueta HUMAN_AGENT fuera de ella, sin
@@ -72,6 +87,7 @@ export const CHANNEL_CAPABILITIES: Record<Channel, ChannelCapabilities> = {
     maxTextBytes: 2000,
     outboundMedia: false,
     deliveryReceipts: false,
+    typingIndicator: false,
   },
 };
 
@@ -98,4 +114,9 @@ export function textFits(channel: Channel, text: string): boolean {
   const max = capabilitiesFor(channel).maxTextBytes;
   if (max === null) return true;
   return Buffer.byteLength(text, "utf8") <= max;
+}
+
+/** ¿Este canal puede mostrarle al contacto que estamos escribiendo? */
+export function supportsTyping(channel: Channel): boolean {
+  return capabilitiesFor(channel).typingIndicator;
 }

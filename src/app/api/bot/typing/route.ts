@@ -1,10 +1,9 @@
-import { and, desc, eq, isNotNull } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getDb, schema } from "@/lib/db";
 import { apiError, parseBody } from "@/lib/api";
 import { requireBotKey, resolveInstanceOrg } from "@/server/bot/auth";
-import { getCredentialsByOrg } from "@/server/whatsapp/credentials";
-import { graphRequest } from "@/lib/meta/client";
+import { markReadAndTyping } from "@/server/whatsapp/presence";
 
 export const dynamic = "force-dynamic";
 
@@ -17,6 +16,9 @@ const bodySchema = z.object({ conversationId: z.string().min(1) });
  * Best-effort por contrato: al bot JAMÁS le vale reintentar esto — si Meta
  * falla se responde 200 {ok:false} y la conversación sigue. El indicador
  * dura hasta ~25 s o hasta que llegue la respuesta real.
+ *
+ * Motivos posibles de {ok:false}: sandbox, channel_unsupported, ai_paused,
+ * no_inbound, meta_error. `no_connection` sale como 409, no como {ok:false}.
  */
 export async function POST(req: Request) {
   const denied = requireBotKey(req);
@@ -42,50 +44,14 @@ export async function POST(req: Request) {
     .limit(1);
   const conv = convs[0];
   if (!conv) return apiError(404, "not_found", "Conversación no encontrada");
-  if (conv.isTest) {
-    // Sandbox: jamás toca la API real (guardrail del Laboratorio).
-    return Response.json({ ok: false, reason: "sandbox" });
-  }
-  if (!conv.aiEnabled || conv.handoffAt) {
-    // Handoff/IA pausada: un humano atiende — "escribiendo…" aquí sería
-    // mentirle al cliente. Se omite sin tocar Meta.
-    return Response.json({ ok: false, reason: "ai_paused" });
-  }
 
-  const msgs = await db
-    .select({ waMessageId: schema.message.waMessageId })
-    .from(schema.message)
-    .where(
-      and(
-        eq(schema.message.organizationId, organizationId),
-        eq(schema.message.conversationId, conv.id),
-        eq(schema.message.direction, "in"),
-        isNotNull(schema.message.waMessageId)
-      )
-    )
-    .orderBy(desc(schema.message.createdAt))
-    .limit(1);
-  const wamid = msgs[0]?.waMessageId;
-  if (!wamid) return Response.json({ ok: false, reason: "no_inbound" });
-
-  const creds = await getCredentialsByOrg(organizationId);
-  if (!creds) {
+  // La lógica vive en `server/whatsapp/presence.ts` porque el agente
+  // in-process la necesita igual, y desde ahí no se puede llamar a un route.
+  // Este handler conserva lo suyo: la API key, el tenant, el 404 y el 409.
+  const result = await markReadAndTyping({ conversation: conv });
+  if (!result.ok && result.reason === "no_connection") {
+    // Se mantiene como 409 y no como {ok:false}: es contrato publicado.
     return apiError(409, "no_connection", "WhatsApp no está conectado");
   }
-
-  try {
-    await graphRequest(`${creds.phoneNumberId}/messages`, {
-      method: "POST",
-      token: creds.token,
-      body: {
-        messaging_product: "whatsapp",
-        status: "read",
-        message_id: wamid,
-        typing_indicator: { type: "text" },
-      },
-    });
-    return Response.json({ ok: true });
-  } catch {
-    return Response.json({ ok: false, reason: "meta_error" });
-  }
+  return Response.json(result);
 }
