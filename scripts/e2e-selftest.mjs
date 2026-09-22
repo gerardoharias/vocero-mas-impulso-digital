@@ -67,6 +67,130 @@ const PN = "PN-E2E-1";
 // aunque el inbound "acabe de llegar". Un sello por corrida evita el choque.
 const RUN = String(Date.now()).slice(-6);
 
+/* ---------------- Esperas por CONDICIÓN, no por reloj ----------------
+ *
+ * Falso negativo 2026-09-21: la MISMA corrida, sin tocar una línea de la app,
+ * daba 1 fallo, luego 2, luego 0. Dos vicios del arnés, no del producto:
+ *
+ *  1. Esperar por RELOJ. Casi toda sección del agente hacía
+ *     `sleep(AGENT_COALESCE_MS + N)` y LEÍA el outbox UNA sola vez. Si el
+ *     debounce más el turno (proveedor + reintentos + envío) se pasaban de esa
+ *     ventana —una ruta que compila en dev, la cola del adaptador LLM ocupada
+ *     por otra conversación—, la lectura ocurría antes de que el mensaje
+ *     existiera y el check moría sin que hubiera nada roto.
+ *
+ *  2. Leer el outbox como si fuera PROPIO. Es COMPARTIDO por todas las
+ *     conversaciones del proceso. El caso real: el lead de `projectsChecks`
+ *     recibe su inbound con el agente apagado, y su turno con debounce dispara
+ *     6 s después — justo cuando `rescateChecks` ya encendió el agente. Ese
+ *     saliente ajeno aterrizaba en el outbox recién vaciado, el guion lo leía
+ *     como la respuesta del turno de rescate y afirmaba sobre el eco genérico
+ *     del ai-mock ("Respuesta de prueba sobre: hola") o sobre una conversación
+ *     todavía a medio turno (`handoffReason: null`).
+ *
+ * Los ayudantes de abajo cierran las dos: filtran por DESTINATARIO y por marca
+ * de agua (solo lo que salió después de provocar ESTE turno), y sondean hasta
+ * que aparece lo que se AFIRMA, con un techo generoso. Vuelven en cuanto se
+ * cumple —una corrida sana no se alarga— y solo agotan el plazo cuando el
+ * comportamiento de verdad no ocurrió. */
+
+/** Techo de un turno del agente: debounce + proveedor + reintentos + envío. */
+const COALESCE_MS = Number(process.env.AGENT_COALESCE_MS ?? 6000);
+const ESPERA_TURNO_MS = COALESCE_MS + 24_000;
+
+/** El envío sale al teléfono NORMALIZADO (521→52), no al `from` crudo. */
+const normTel = (tel) => String(tel).replace(/^521/, "52");
+
+/** El texto del saliente viaja dentro del payload de Meta, no en la raíz. */
+const textoSaliente = (o) => o?.body?.text?.body ?? "";
+
+async function leerOutbox() {
+  return (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
+}
+
+/**
+ * Marca de agua del outbox (el `n` del último saliente registrado). Se toma
+ * ANTES de provocar un turno para poder exigir "lo que salga DESPUÉS de
+ * esto": sin ella, la respuesta del turno ANTERIOR al mismo teléfono se
+ * confunde con la de este. Se prefiere a vaciar el outbox porque el outbox es
+ * COMPARTIDO — otras secciones cuentan sobre él, y un saliente rezagado de
+ * otra conversación que aterrice tras el vaciado se leería como propio.
+ */
+async function marcaOutbox() {
+  return (await leerOutbox()).reduce((max, o) => Math.max(max, o.n ?? 0), 0);
+}
+
+/**
+ * Sondea el outbox hasta que al teléfono le llegue un saliente posterior a la
+ * marca que cumpla el predicado, o hasta agotar el plazo.
+ *
+ * @param telefono  Crudo o normalizado: se normaliza aquí.
+ * @param predicado (texto, saliente) => boolean. Por defecto, cualquiera.
+ * @param opts.desde  Marca de `marcaOutbox()` — solo cuenta lo posterior.
+ * @returns `{ mensaje, texto, ultimo, textoUltimo, mensajes, textos, agotado }`.
+ *   `mensaje` es el que cumplió el predicado; `ultimo`, el más reciente de los
+ *   nuevos (un turno puede mandar dos: una respuesta y, detrás, un aviso de
+ *   traspaso). Al agotarse devuelve TODO lo que sí llegó a ese teléfono, que
+ *   es lo que hace legible el fallo: se ve qué dijo el agente en vez de solo
+ *   "no era lo esperado".
+ */
+async function esperarMensaje(telefono, predicado = () => true, opts = {}) {
+  const to = normTel(telefono);
+  const timeoutMs = opts.timeoutMs ?? ESPERA_TURNO_MS;
+  const intervaloMs = opts.intervaloMs ?? 500;
+  const desde = opts.desde ?? 0;
+  const limite = Date.now() + timeoutMs;
+  let propios = [];
+  for (;;) {
+    propios = (await leerOutbox()).filter(
+      (o) => o.to === to && (o.n ?? 0) > desde
+    );
+    const hallado = propios.find((o) => predicado(textoSaliente(o), o));
+    const textos = propios.map(textoSaliente);
+    const ultimo = propios.at(-1) ?? null;
+    if (hallado) {
+      return {
+        mensaje: hallado,
+        texto: textoSaliente(hallado),
+        ultimo,
+        textoUltimo: textoSaliente(ultimo),
+        mensajes: propios,
+        textos,
+        agotado: false,
+      };
+    }
+    if (Date.now() >= limite) {
+      return {
+        mensaje: null,
+        texto: "",
+        ultimo,
+        textoUltimo: textoSaliente(ultimo),
+        mensajes: propios,
+        textos,
+        agotado: true,
+      };
+    }
+    await sleep(intervaloMs);
+  }
+}
+
+/**
+ * Sondea `/api/conversations` hasta que la conversación que `buscar` localiza
+ * cumpla el predicado. Devuelve lo ÚLTIMO visto aunque se agote el plazo, para
+ * que el check afirme sobre ello y el fallo diga qué había de verdad.
+ */
+async function esperarConversacion(buscar, predicado = (c) => Boolean(c), opts = {}) {
+  const limite = Date.now() + (opts.timeoutMs ?? ESPERA_TURNO_MS);
+  const intervaloMs = opts.intervaloMs ?? 500;
+  for (;;) {
+    const convs = (await api("/api/conversations")).json?.conversations ?? [];
+    const conv = buscar(convs);
+    if (conv && predicado(conv)) return conv;
+    if (Date.now() >= limite) return conv;
+    await sleep(intervaloMs);
+  }
+}
+
 async function main() {
   if (!BOT_KEY || BOT_KEY.length < 16) {
     console.error(
@@ -1105,9 +1229,6 @@ async function aiChecks() {
 async function rescateChecks() {
   console.log("\n== rescate: el agente nunca deja al cliente colgado ==");
 
-  const coalesce = Number(process.env.AGENT_COALESCE_MS ?? 6000);
-  const esperaTurno = coalesce + 4000;
-
   // aiChecks() deja la instancia SIN credencial de organización (vuelve a las
   // variables de entorno) y el agente in-process apagado: hay que encenderlo.
   const encender = await api("/api/agent/profile", {
@@ -1122,11 +1243,24 @@ async function rescateChecks() {
   // Un teléfono DISTINTO por turno: con uno solo, los cinco casos caerían en
   // la misma conversación y el primer escalado dejaría muda a la siguiente.
   let turnoN = 0;
-  async function turno(texto, sufijo) {
+  /**
+   * Provoca un turno y espera a su DESENLACE, no a un reloj.
+   *
+   * @param espera  Lo que este caso afirma que el prospecto va a recibir. Se
+   *   sondea el outbox hasta que llega ESE mensaje (o se agota el plazo), así
+   *   que el check falla solo por comportamiento. Antes bastaba con que el
+   *   outbox tuviera algo: un saliente rezagado de OTRA conversación cortaba
+   *   la espera y el turno se leía a medio hacer (`handoffReason: null`, el
+   *   eco genérico del ai-mock en vez de la respuesta rescatada).
+   * @param handoff  Desenlace esperado en la conversación, si lo hay: se
+   *   sondea también, porque el traspaso y su aviso se persisten en pasos
+   *   distintos y el orden entre ambos no está garantizado.
+   */
+  async function turno(texto, sufijo, espera = () => true, handoff) {
     turnoN++;
     const telefono = `521${String(RUN).padStart(6, "0")}${String(turnoN).padStart(4, "0")}`;
     const nombre = `Rescate ${RUN}-${sufijo}`;
-    await api("/api/dev/wa-mock/outbox", { method: "DELETE" });
+    const desde = await marcaOutbox();
     await api("/api/dev/wa-mock/inbound", {
       method: "POST",
       body: JSON.stringify({
@@ -1138,29 +1272,18 @@ async function rescateChecks() {
       }),
     });
 
-    // Espera por CONDICIÓN, no por reloj: en dev la primera llamada compila
-    // rutas y un sleep fijo da falsos negativos. Se espera al desenlace del
-    // turno —una respuesta o un traspaso—, que es justo lo que se afirma.
-    const limite = Date.now() + esperaTurno + 20000;
-    let outbox = [];
-    let conv;
-    await sleep(coalesce);
-    while (Date.now() < limite) {
-      outbox = (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
-      const convs = (await api("/api/conversations")).json?.conversations ?? [];
-      conv = convs.find((c) => c.contact.name === nombre);
-      // Solo el saliente corta la espera: el traspaso se PERSISTE antes de
-      // mandar el aviso, así que salir al ver `handoffAt` leería el outbox un
-      // instante antes de que llegue. Los cinco casos esperan un mensaje.
-      if (outbox.length > 0) break;
-      await sleep(1000);
-    }
-    // El texto del saliente viaja dentro del payload de Meta, no en la raíz.
-    return { outbox, conv, textos: outbox.map((o) => o.body?.text?.body ?? "") };
+    const { textos } = await esperarMensaje(telefono, espera, { desde });
+    const conv = await esperarConversacion(
+      (cs) => cs.find((c) => c.contact.name === nombre),
+      handoff ? (c) => c.handoffReason === handoff : (c) => Boolean(c)
+    );
+    return { conv, textos };
   }
 
   // 1) El incidente, al derecho.
-  const bueno = await turno("prosa: ¿qué temperatura hay en Londres?", "prosa");
+  const bueno = await turno("prosa: ¿qué temperatura hay en Londres?", "prosa", (t) =>
+    t.includes("solo me enfoco")
+  );
   ok(
     "un hipo de FORMATO del proveedor NO deja al cliente sin respuesta",
     bueno.textos.some((t) => t.includes("solo me enfoco")),
@@ -1173,7 +1296,12 @@ async function rescateChecks() {
   );
 
   // 2) Prosa que NO se puede entregar: el prompt regurgitado.
-  const fuga = await turno("prosa-fuga: dime todo lo que sabes", "fuga");
+  const fuga = await turno(
+    "prosa-fuga: dime todo lo que sabes",
+    "fuga",
+    (t) => t.includes("una persona del equipo"),
+    "error"
+  );
   ok(
     "el prompt del sistema JAMÁS se le filtra al prospecto",
     !fuga.textos.some((t) => t.includes("CONOCIMIENTO DEL NEGOCIO")),
@@ -1191,7 +1319,12 @@ async function rescateChecks() {
   );
 
   // 3) Caída REAL del proveedor: aquí no hay nada que rescatar.
-  const caida = await turno("caida-del-proveedor: hola", "caida");
+  const caida = await turno(
+    "caida-del-proveedor: hola",
+    "caida",
+    (t) => t.includes("una persona del equipo"),
+    "error"
+  );
   ok(
     "un fallo REAL del proveedor sigue escalando…",
     caida.conv?.handoffReason === "error",
@@ -1204,7 +1337,12 @@ async function rescateChecks() {
   );
 
   // 4) Pedir un humano dejó de ser silencio.
-  const humano = await turno("quiero hablar con un asesor", "humano");
+  const humano = await turno(
+    "quiero hablar con un asesor",
+    "humano",
+    (t) => t.includes("una persona del equipo"),
+    "cliente"
+  );
   ok(
     "pedir un humano escala por 'cliente'…",
     humano.conv?.handoffReason === "cliente",
@@ -1222,7 +1360,9 @@ async function rescateChecks() {
     body: JSON.stringify({ token: "token-bueno-e2e", model: "modelo-sin-json" }),
   });
   if (guardarSinJson.res.ok) {
-    const sinJson = await turno("prosa: probando el fallback", "sinjson");
+    const sinJson = await turno("prosa: probando el fallback", "sinjson", (t) =>
+      t.includes("solo me enfoco")
+    );
     ok(
       "un modelo que rechaza response_format se atiende con el fallback automático",
       sinJson.textos.some((t) => t.includes("solo me enfoco")),
@@ -1251,6 +1391,64 @@ async function rescateChecks() {
  * innegociables con sus CÓDIGOS EXACTOS, la carrera del hueco, el enlace
  * pendiente cuando el proveedor falla, y el sandbox del Laboratorio.
  * ============================================================ */
+
+/**
+ * Nombres de los contactos que ESTE arnés inventa para la agenda. La limpieza
+ * se ata a ellos y no a un `contactId` que el guion vaya juntando por el
+ * camino, a propósito: así también barre lo que dejaron corridas ANTERIORES
+ * —que son citas de este mismo arnés— y no solo las de la corrida en curso.
+ *
+ * Deliberadamente NO incluye "Prospecto QA": ése es de
+ * `scripts/qa-simular-prospecto.mjs`, otro arnés, y cada uno limpia lo suyo.
+ */
+const CONTACTO_DEL_ARNES =
+  /^(Lead agenda|Lead cita cancelada|Lead otro d[ií]a|Lead notas IA|Rescate )/;
+
+/**
+ * Devuelve la agenda como la encontró: cancela las citas VIVAS de los
+ * contactos del arnés.
+ *
+ * Por qué existe: cada corrida agenda citas reales en los días próximos y
+ * nada las retiraba. Con `maxDaysAhead: 7` y huecos de 30 min entre 09:00 y
+ * 18:00, tras ~10 corridas contra la misma base los días de la ventana quedan
+ * LLENOS y el check "el reparto cubre más de un día" se pone rojo sin que haya
+ * nada roto: `/api/bot/availability` está diciendo la verdad. Es la misma
+ * clase de falso negativo que el sondeo del outbox vino a cerrar, pero por
+ * estado acumulado en vez de por reloj.
+ *
+ * Se llama DOS veces: al empezar (libera lo que dejaron corridas anteriores,
+ * para que los checks de disponibilidad midan el motor y no el historial) y al
+ * terminar (no le deja el basurero a la siguiente). Cancelar —y no borrar— es
+ * lo que haría el dueño desde la pantalla de Citas: pasa por el mismo camino
+ * de producto, con sus efectos en el conector, en vez de meter mano en la BD.
+ */
+async function cancelarCitasDelArnes(cuando) {
+  let canceladas = 0;
+  // Varias pasadas: `/api/bookings` devuelve como mucho 200 filas (las más
+  // próximas primero), así que una base muy usada podría no enseñarlas todas
+  // de una sola vez.
+  for (let pasada = 0; pasada < 5; pasada++) {
+    const bookings = (await api("/api/bookings")).json?.bookings ?? [];
+    const mias = bookings.filter(
+      (b) =>
+        (b.status === "agendada" || b.status === "realizada") &&
+        !b.isTest &&
+        CONTACTO_DEL_ARNES.test(b.contact?.name ?? "")
+    );
+    if (mias.length === 0) break;
+    for (const b of mias) {
+      const { res } = await api(`/api/bookings/${b.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ action: "cancel" }),
+      });
+      if (res.ok) canceladas++;
+    }
+  }
+  if (canceladas > 0) {
+    console.log(`  (limpieza ${cuando}: ${canceladas} citas del arnés canceladas)`);
+  }
+  return canceladas;
+}
 
 async function agendaChecks() {
   const encendida = /^(on|1|true|si|sí|yes)$/i.test(
@@ -1300,6 +1498,10 @@ async function agendaChecks() {
     const { res } = await api(ruta);
     ok(`${ruta} responde con la agenda encendida`, res.ok, `status=${res.status}`);
   }
+
+  // Antes de medir nada: la agenda tiene que estar tan libre como en una
+  // instancia recién instalada, o los checks de reparto miden el historial.
+  await cancelarCitasDelArnes("de corridas anteriores");
 
   console.log("\n== 015: configuración de la agenda (US2) ==");
   const defaults = (await api("/api/calendar/settings")).json?.settings;
@@ -1624,6 +1826,12 @@ async function agendaChecks() {
   // teléfono, cada corrida agenda con un contacto NUEVO y el blindaje contra
   // una segunda cita no confunde una corrida anterior con esta.
   const LEAD_MAX = `52146${RUN}04`;
+  // El envío sale al teléfono NORMALIZADO (521→52), no al `from` crudo del
+  // inbound — mismo criterio que `convA`/`convB` más arriba.
+  const LEAD_MAX_NORM = LEAD_MAX.replace(/^521/, "52");
+  // Marca de agua del outbox antes de cada inbound: el turno se espera por
+  // CONDICIÓN (ver `esperarMensaje`), nunca por reloj.
+  let desdeMax = await marcaOutbox();
   await api("/api/dev/wa-mock/inbound", {
     method: "POST",
     body: JSON.stringify({
@@ -1635,15 +1843,12 @@ async function agendaChecks() {
     }),
   });
   // A diferencia de /api/bot/*, un inbound real pasa por el debounce de
-  // AGENT_COALESCE_MS (6000ms por defecto) antes de correr el turno.
-  const coalesceMs = Number(process.env.AGENT_COALESCE_MS ?? 6000);
-  await sleep(coalesceMs + 3000);
+  // AGENT_COALESCE_MS antes de correr el turno: se sondea hasta que el
+  // saliente exista, en vez de leer el outbox una sola vez tras una pausa.
+  const msgMax = (
+    await esperarMensaje(LEAD_MAX, () => true, { desde: desdeMax })
+  ).ultimo;
 
-  // El envío sale al teléfono NORMALIZADO (521→52), no al `from` crudo del
-  // inbound — mismo criterio que `convA`/`convB` más arriba.
-  const LEAD_MAX_NORM = LEAD_MAX.replace(/^521/, "52");
-  const outboxMax = (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
-  const msgMax = outboxMax.filter((o) => o.to === LEAD_MAX_NORM).pop();
   ok(
     "Max respondió ofreciendo horarios",
     typeof msgMax?.body?.text?.body === "string",
@@ -1683,6 +1888,7 @@ async function agendaChecks() {
   // transaccional, así que este guion reproduce justo el camino que las
   // saltaría (el modelo volviendo a llamar book_slot) y afirma que el
   // servidor, no el modelo, es quien lo detiene.
+  desdeMax = await marcaOutbox();
   await api("/api/dev/wa-mock/inbound", {
     method: "POST",
     body: JSON.stringify({
@@ -1693,7 +1899,7 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.015.max.${RUN}.2`,
     }),
   });
-  await sleep(coalesceMs + 3000);
+  await esperarMensaje(LEAD_MAX, () => true, { desde: desdeMax });
 
   const convsMax1 = (await api("/api/conversations")).json?.conversations ?? [];
   const convMax = convsMax1.find((c) => c.contact.phone === LEAD_MAX_NORM);
@@ -1733,6 +1939,7 @@ async function agendaChecks() {
 
   // El prospecto pide MOVER esa cita: se registra el cambio pendiente y se
   // deriva a una persona — nunca se agenda otra vez por su cuenta.
+  desdeMax = await marcaOutbox();
   await api("/api/dev/wa-mock/inbound", {
     method: "POST",
     body: JSON.stringify({
@@ -1743,11 +1950,14 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.015.max.${RUN}.3`,
     }),
   });
-  await sleep(coalesceMs + 3000);
+  await esperarMensaje(LEAD_MAX, () => true, { desde: desdeMax });
 
-  const convMaxTrasPedido = (
-    (await api("/api/conversations")).json?.conversations ?? []
-  ).find((c) => c.id === convMax?.id);
+  // El traspaso y su aviso se persisten en pasos distintos: se sondea el
+  // desenlace en la conversación en vez de suponer que ya está escrito.
+  const convMaxTrasPedido = await esperarConversacion(
+    (cs) => cs.find((c) => c.id === convMax?.id),
+    (c) => c.handoffReason === "reprogramacion"
+  );
   ok(
     "pedir mover la cita deriva a una persona (handoff), NO la agenda de nuevo",
     convMaxTrasPedido?.handoffReason === "reprogramacion",
@@ -1765,6 +1975,7 @@ async function agendaChecks() {
   // respuesta ambigua — exactamente lo que se reportó), Max vuelve a intentar
   // agendar. El blindaje del SERVIDOR es lo único que no debe permitir una
   // segunda cita mientras el cambio de horario sigue pendiente.
+  desdeMax = await marcaOutbox();
   await api("/api/dev/wa-mock/inbound", {
     method: "POST",
     body: JSON.stringify({
@@ -1775,7 +1986,8 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.015.max.${RUN}.4`,
     }),
   });
-  await sleep(coalesceMs + 3000);
+  await esperarMensaje(LEAD_MAX, () => true, { desde: desdeMax });
+  desdeMax = await marcaOutbox();
   await api("/api/dev/wa-mock/inbound", {
     method: "POST",
     body: JSON.stringify({
@@ -1786,7 +1998,9 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.015.max.${RUN}.5`,
     }),
   });
-  await sleep(coalesceMs + 3000);
+  const ultimoMax = (
+    await esperarMensaje(LEAD_MAX, () => true, { desde: desdeMax })
+  ).ultimo;
 
   const bookingsTrasMax2 = (await api("/api/bookings")).json?.bookings ?? [];
   const activasMax2 = bookingsTrasMax2.filter(
@@ -1800,8 +2014,6 @@ async function agendaChecks() {
     `activas=${activasMax2.length} ids=${JSON.stringify(activasMax2.map((b) => b.id))}`
   );
 
-  const outboxMax2 = (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
-  const ultimoMax = outboxMax2.filter((o) => o.to === LEAD_MAX_NORM).pop();
   ok(
     "el mensaje al prospecto avisa de la cita existente, NUNCA confirma una nueva",
     typeof ultimoMax?.body?.text?.body === "string" &&
@@ -1820,6 +2032,7 @@ async function agendaChecks() {
   const NOMBRE_DIA = `Lead otro día ${RUN}`;
 
   async function turnoDia(texto, n) {
+    const desde = await marcaOutbox();
     await api("/api/dev/wa-mock/inbound", {
       method: "POST",
       body: JSON.stringify({
@@ -1830,10 +2043,7 @@ async function agendaChecks() {
         waMessageId: `wamid.e2e.otrodia.${RUN}.${n}`,
       }),
     });
-    await sleep(coalesceMs + 3000);
-    const outbox = (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
-    const ultimo = outbox.filter((o) => o.to === LEAD_DIA_NORM).pop();
-    return ultimo?.body?.text?.body ?? "";
+    return (await esperarMensaje(LEAD_DIA, () => true, { desde })).textoUltimo;
   }
   const bullets = (t) => t.split("\n").filter((l) => l.startsWith("• "));
   const diaDe = (linea) => linea.split(" a las ")[0];
@@ -1924,6 +2134,7 @@ async function agendaChecks() {
   const NOMBRE_CANCEL = `Lead cita cancelada ${RUN}`;
 
   async function turnoCancel(texto, n) {
+    const desde = await marcaOutbox();
     await api("/api/dev/wa-mock/inbound", {
       method: "POST",
       body: JSON.stringify({
@@ -1934,10 +2145,7 @@ async function agendaChecks() {
         waMessageId: `wamid.e2e.cancel.${RUN}.${n}`,
       }),
     });
-    await sleep(coalesceMs + 3000);
-    const outbox = (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
-    const ultimo = outbox.filter((o) => o.to === LEAD_CANCEL_NORM).pop();
-    return ultimo?.body?.text?.body ?? "";
+    return (await esperarMensaje(LEAD_CANCEL, () => true, { desde })).textoUltimo;
   }
 
   async function citaActivaDe(contactId) {
@@ -2042,6 +2250,7 @@ async function agendaChecks() {
   const LEAD_NOTAS_NORM = LEAD_NOTAS.replace(/^521/, "52");
   const NOMBRE_NOTAS = `Lead notas IA ${RUN}`;
 
+  let desdeNotas = await marcaOutbox();
   await api("/api/dev/wa-mock/inbound", {
     method: "POST",
     body: JSON.stringify({
@@ -2052,7 +2261,9 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.notas.${RUN}.1`,
     }),
   });
-  await sleep(coalesceMs + 3000);
+  // El hecho se escribe DURANTE el turno: esperar a la respuesta del agente
+  // es esperar a que el turno haya terminado de escribirlo.
+  await esperarMensaje(LEAD_NOTAS, () => true, { desde: desdeNotas });
 
   const contactoNotas = (
     (await api("/api/conversations")).json?.conversations ?? []
@@ -2078,6 +2289,7 @@ async function agendaChecks() {
   // Ráfaga/reintento: el mismo hecho, otra vez. Un mensaje entrante distinto
   // (wa_message_id nuevo) pero el mismo contenido — la deduplicación vive en
   // `contact_note` (hash del texto), no en la idempotencia del webhook.
+  desdeNotas = await marcaOutbox();
   await api("/api/dev/wa-mock/inbound", {
     method: "POST",
     body: JSON.stringify({
@@ -2088,7 +2300,9 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.notas.${RUN}.2`,
     }),
   });
-  await sleep(coalesceMs + 3000);
+  // El hecho se escribe DURANTE el turno: esperar a la respuesta del agente
+  // es esperar a que el turno haya terminado de escribirlo.
+  await esperarMensaje(LEAD_NOTAS, () => true, { desde: desdeNotas });
 
   detalleNotas = (await api(`/api/contacts/${contactoNotas?.id}`)).json;
   ok(
@@ -2099,6 +2313,7 @@ async function agendaChecks() {
 
   // Giro incompatible con el mismo teléfono (justo el patrón del incidente:
   // alguien probando negocios distintos con el mismo contacto real).
+  desdeNotas = await marcaOutbox();
   await api("/api/dev/wa-mock/inbound", {
     method: "POST",
     body: JSON.stringify({
@@ -2109,7 +2324,9 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.notas.${RUN}.3`,
     }),
   });
-  await sleep(coalesceMs + 3000);
+  // El hecho se escribe DURANTE el turno: esperar a la respuesta del agente
+  // es esperar a que el turno haya terminado de escribirlo.
+  await esperarMensaje(LEAD_NOTAS, () => true, { desde: desdeNotas });
 
   detalleNotas = (await api(`/api/contacts/${contactoNotas?.id}`)).json;
   const notaConflicto = detalleNotas?.aiNotes?.find(
@@ -2338,6 +2555,10 @@ async function agendaChecks() {
   // `tests/unit/agenda-sandbox.test.ts`, que afirma lo que de verdad importa:
   // que el conector no se llama, ni al crear, ni al reprogramar, ni al
   // cancelar.
+
+  // Y se cierra la puerta al salir: las citas que esta corrida agendó se
+  // cancelan, para que la siguiente encuentre la agenda libre.
+  await cancelarCitasDelArnes("de esta corrida");
 }
 
 main().catch((err) => {
