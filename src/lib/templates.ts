@@ -9,6 +9,9 @@ const VARIABLE_REGEX = /\{\{\s*(\d+)\s*\}\}/g;
 /** Máximo de parámetros posicionales por cuerpo que acepta Meta. */
 export const MAX_TEMPLATE_VARIABLES = 10;
 
+/** Largo máximo del cuerpo YA renderizado que acepta Meta. */
+export const MAX_TEMPLATE_BODY_CHARS = 1024;
+
 /** Índices distintos de {{n}} presentes en el cuerpo, ordenados. */
 function variableIndexes(body: string): number[] {
   const found = new Set<number>();
@@ -40,7 +43,33 @@ export function validateBodyVariables(body: string): string | null {
       return `Las variables deben ir numeradas {{1}}, {{2}}, … sin saltos (falta {{${i + 1}}})`;
     }
   }
+  // Meta rechaza el cuerpo que abre o cierra con un parámetro: necesita texto
+  // fijo alrededor para entender de qué trata la plantilla.
+  const trimmed = body.trim();
+  if (/^\{\{\s*\d+\s*\}\}/.test(trimmed)) {
+    return "El cuerpo no puede empezar con una variable: pon texto antes";
+  }
+  if (/\{\{\s*\d+\s*\}\}$/.test(trimmed)) {
+    return "El cuerpo no puede terminar con una variable: pon texto después (basta un punto)";
+  }
   return null;
+}
+
+/**
+ * Deja un valor listo para ir como parámetro de plantilla. Meta rechaza
+ * (132018) el parámetro con saltos de línea, tabuladores o más de 4 espacios
+ * seguidos, así que lo escrito en varios renglones se aplana a uno solo.
+ */
+export function sanitizeTemplateParam(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Plantilla genérica (fuera de ventana): la única que puede envolver lo que
+ * el operador escribe es la de exactamente una variable.
+ */
+export function canBeWindowFallback(body: string): boolean {
+  return countVariables(body) === 1;
 }
 
 /** Sustituye {{n}} por `variables[n-1]` (vacío si no hay valor). */

@@ -1152,11 +1152,177 @@ async function main() {
   await quotesChecks();
   await assetsChecks();
   await projectsChecks();
+  await plantillaGenericaChecks();
   await aiChecks();
   await rescateChecks();
 
   console.log(`\n===== ${checks - failures}/${checks} checks OK, ${failures} fallos =====`);
   process.exit(failures > 0 ? 1 : 0);
+}
+
+/* ============================================================
+ * Plantilla genérica fuera de ventana (tests/e2e/us6-templates.md,
+ * sección "Plantilla genérica"): con la ventana de 24 h cerrada, lo que el
+ * operador escribe sale como {{1}} de la plantilla marcada como genérica.
+ * ============================================================ */
+async function plantillaGenericaChecks() {
+  const stamp = Date.now().toString(36);
+  const WABA = "WABA-E2E";
+  const cuerpoGenerica = "Dando seguimiento a la cita agendada.\n{{1}}\n\nSaludos!";
+  const plantillas = async () => (await api("/api/templates")).json?.templates ?? [];
+  const crear = (name, body) =>
+    api("/api/templates", {
+      method: "POST",
+      body: JSON.stringify({ name, language: "es_MX", category: "UTILITY", body }),
+    });
+  const marcar = (id, isWindowFallback) =>
+    api(`/api/templates/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ isWindowFallback }),
+    });
+
+  console.log("\n== plantilla genérica: alta y validaciones ==");
+  const nombreA = `aviso_general_${stamp}`;
+  const a = await crear(nombreA, cuerpoGenerica);
+  ok("alta de la genérica (texto antes y después de {{1}})", a.res.status === 201, JSON.stringify(a.json));
+  const idA = a.json?.template?.id;
+  ok("nace SIN marca de genérica", a.json?.template?.isWindowFallback === false, JSON.stringify(a.json?.template));
+
+  const alFinal = await crear(`al_final_${stamp}`, "Le recordamos su cita a las {{1}}");
+  ok(
+    "cuerpo que TERMINA en variable → 422 antes de gastar la llamada a Meta",
+    alFinal.res.status === 422 && /terminar/.test(alFinal.json?.error?.message ?? ""),
+    JSON.stringify(alFinal.json)
+  );
+
+  const dos = await crear(`dos_vars_${stamp}`, "Hola {{1}}, te esperamos el {{2}}.");
+  const marcarDos = await marcar(dos.json?.template?.id, true);
+  ok(
+    "una plantilla de 2 variables NO puede ser la genérica → 422",
+    marcarDos.res.status === 422,
+    JSON.stringify(marcarDos.json)
+  );
+  const ajena = await marcar("tpl_no_existe", true);
+  ok("plantilla inexistente → 404", ajena.res.status === 404, `status=${ajena.res.status}`);
+  const malo = await api(`/api/templates/${idA}`, {
+    method: "PATCH",
+    body: JSON.stringify({ isWindowFallback: "sí" }),
+  });
+  ok("payload inválido → 400/422", [400, 422].includes(malo.res.status), `status=${malo.res.status}`);
+
+  console.log("\n== plantilla genérica: a lo más una por organización ==");
+  const mA = await marcar(idA, true);
+  ok("marcar A como genérica", mA.res.ok && mA.json?.template?.isWindowFallback === true, JSON.stringify(mA.json));
+  const b = await crear(`aviso_b_${stamp}`, "Seguimiento: {{1}}. Saludos.");
+  const idB = b.json?.template?.id;
+  const mB = await marcar(idB, true);
+  ok("marcar B como genérica", mB.res.ok, JSON.stringify(mB.json));
+  let lista = await plantillas();
+  const marcadas = lista.filter((t) => t.isWindowFallback);
+  ok(
+    "marcar B desmarcó A: solo UNA genérica",
+    marcadas.length === 1 && marcadas[0]?.id === idB,
+    JSON.stringify(marcadas.map((t) => t.name))
+  );
+  await marcar(idA, true);
+  lista = await plantillas();
+  ok(
+    "volver a marcar A deja solo A",
+    lista.filter((t) => t.isWindowFallback).map((t) => t.id).join() === idA,
+    JSON.stringify(lista.filter((t) => t.isWindowFallback).map((t) => t.name))
+  );
+
+  console.log("\n== plantilla genérica: aprobación y ventana cerrada ==");
+  await api("/api/dev/wa-mock/template-status", {
+    method: "POST",
+    body: JSON.stringify({ wabaId: WABA, name: nombreA, language: "es_MX", event: "APPROVED", notify: false }),
+  });
+  await api("/api/templates/sync", { method: "POST" });
+  lista = await plantillas();
+  const genA = lista.find((t) => t.id === idA);
+  ok(
+    "aprobada por Meta y sigue marcada (la marca es local)",
+    genA?.status === "approved" && genA?.isWindowFallback === true,
+    JSON.stringify(genA)
+  );
+
+  // Un contacto capturado a mano nunca ha escrito: su ventana está cerrada.
+  const telefono = `52155${String(Date.now()).slice(-8)}`;
+  const contacto = await api("/api/contacts", {
+    method: "POST",
+    body: JSON.stringify({ name: `Richard Genérica ${stamp}`, phone: telefono }),
+  });
+  ok("contacto capturado a mano", contacto.res.status === 201, JSON.stringify(contacto.json));
+  const inicio = await api(`/api/contacts/${contacto.json?.contact?.id}/start-conversation`, {
+    method: "POST",
+    body: JSON.stringify({ templateId: idA, variables: ["Primer contacto"] }),
+  });
+  ok("conversación abierta con la genérica", inicio.res.ok, JSON.stringify(inicio.json));
+  const convId = inicio.json?.conversationId;
+  const conv = ((await api("/api/conversations")).json?.conversations ?? []).find(
+    (c) => c.id === convId
+  );
+  ok("la ventana de 24 h está cerrada", conv?.windowOpen === false, JSON.stringify(conv)?.slice(0, 200));
+
+  const libre = await api(`/api/conversations/${convId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ text: "texto libre" }),
+  });
+  ok(
+    "el texto libre fuera de ventana sigue prohibido en el núcleo (409 window_closed)",
+    libre.res.status === 409 && libre.json?.error?.code === "window_closed",
+    JSON.stringify(libre.json)
+  );
+
+  console.log("\n== plantilla genérica: lo escrito viaja como {{1}} ==");
+  const escrito = "Le recuerdo que tiene una cita agendada\npara mañana a las 10 am";
+  const desde = await marcaOutbox();
+  const envio = await api(`/api/conversations/${convId}/messages/template`, {
+    method: "POST",
+    body: JSON.stringify({ templateId: idA, variables: [escrito] }),
+  });
+  ok("envío por la genérica 200", envio.res.ok, JSON.stringify(envio.json));
+  const salida = (await leerOutbox()).filter((o) => o.to === normTel(telefono) && (o.n ?? 0) > desde).at(-1);
+  const params = salida?.body?.template?.components?.find((c) => c.type === "body")?.parameters ?? [];
+  ok(
+    "a Meta va type=template con el nombre de la genérica",
+    salida?.body?.type === "template" && salida?.body?.template?.name === nombreA,
+    JSON.stringify(salida?.body)?.slice(0, 300)
+  );
+  ok(
+    "{{1}} = lo escrito, aplanado a un renglón (Meta 132018 no admite saltos)",
+    params.length === 1 &&
+      params[0]?.text === "Le recuerdo que tiene una cita agendada para mañana a las 10 am",
+    JSON.stringify(params)
+  );
+  const hilo = (await api(`/api/conversations/${convId}/messages`)).json?.messages ?? [];
+  const burbuja = [...hilo].reverse().find((m) => m.type === "template");
+  ok(
+    "el hilo muestra la plantilla completa ya sustituida",
+    burbuja?.text ===
+      "Dando seguimiento a la cita agendada.\nLe recuerdo que tiene una cita agendada para mañana a las 10 am\n\nSaludos!",
+    JSON.stringify(burbuja?.text)
+  );
+
+  console.log("\n== plantilla genérica: caminos infelices ==");
+  const largo = await api(`/api/conversations/${convId}/messages/template`, {
+    method: "POST",
+    body: JSON.stringify({ templateId: idA, variables: ["x".repeat(480) + " " + "y".repeat(480) + " " + "z".repeat(90)] }),
+  });
+  ok(
+    "mensaje que rebasa 1024 caracteres → 422 que dice cuánto sobra",
+    largo.res.status === 422 && /1024/.test(largo.json?.error?.message ?? ""),
+    JSON.stringify(largo.json)
+  );
+  const vacio = await api(`/api/conversations/${convId}/messages/template`, {
+    method: "POST",
+    body: JSON.stringify({ templateId: idA, variables: [" \n\t "] }),
+  });
+  ok("solo espacios y saltos → 422 (valor faltante)", vacio.res.status === 422, JSON.stringify(vacio.json));
+
+  // Limpieza: la marca no se queda puesta para otras secciones ni corridas.
+  const quitar = await marcar(idA, false);
+  ok("desmarcar la genérica", quitar.res.ok && quitar.json?.template?.isWindowFallback === false, JSON.stringify(quitar.json));
 }
 
 /* ============================================================

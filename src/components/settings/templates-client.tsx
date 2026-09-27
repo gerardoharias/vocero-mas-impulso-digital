@@ -3,7 +3,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import type { TemplateDto } from "@/lib/types";
-import { countVariables, validateBodyVariables } from "@/lib/templates";
+import {
+  canBeWindowFallback,
+  countVariables,
+  validateBodyVariables,
+} from "@/lib/templates";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -25,6 +29,8 @@ export function TemplatesClient() {
   const [templates, setTemplates] = useState<TemplateDto[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
+  const [fallbackBusy, setFallbackBusy] = useState<string | null>(null);
+  const [fallbackError, setFallbackError] = useState<string | null>(null);
 
   const refetch = useCallback(async () => {
     const res = await fetch("/api/templates").catch(() => null);
@@ -74,6 +80,25 @@ export function TemplatesClient() {
     void refetch().then(() => sync({ silent: true }));
   }, [refetch, sync]);
 
+  async function toggleFallback(t: TemplateDto, enabled: boolean) {
+    setFallbackBusy(t.id);
+    setFallbackError(null);
+    const res = await fetch(`/api/templates/${t.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ isWindowFallback: enabled }),
+    }).catch(() => null);
+    setFallbackBusy(null);
+    if (!res?.ok) {
+      const data = (await res?.json().catch(() => null)) as {
+        error?: { message?: string };
+      } | null;
+      setFallbackError(data?.error?.message ?? "No se pudo cambiar la plantilla genérica");
+      return;
+    }
+    void refetch();
+  }
+
   return (
     <div className="max-w-3xl space-y-6">
       <div className="flex items-start justify-between gap-4">
@@ -94,6 +119,9 @@ export function TemplatesClient() {
       <CreateForm onCreated={() => void refetch()} />
 
       <div className="space-y-2">
+        {fallbackError && (
+          <p className="text-xs text-destructive">{fallbackError}</p>
+        )}
         {templates.map((t) => (
           <div key={t.id} className="rounded-lg border bg-card p-4">
             <div className="flex items-center justify-between gap-3">
@@ -103,15 +131,49 @@ export function TemplatesClient() {
                   ({t.language} · {t.category})
                 </span>
               </p>
-              <Badge variant={STATUS_BADGE[t.status].variant}>
-                {STATUS_BADGE[t.status].label}
-              </Badge>
+              <div className="flex shrink-0 items-center gap-1.5">
+                {t.isWindowFallback && (
+                  <Badge variant="default">Genérica</Badge>
+                )}
+                <Badge variant={STATUS_BADGE[t.status].variant}>
+                  {STATUS_BADGE[t.status].label}
+                </Badge>
+              </div>
             </div>
-            <p className="mt-2 text-sm text-muted-foreground">{t.body}</p>
+            <p className="mt-2 whitespace-pre-line text-sm text-muted-foreground">
+              {t.body}
+            </p>
             {t.status === "rejected" && t.rejectionReason && (
               <p className="mt-2 text-xs text-destructive">
                 Razón del rechazo: {t.rejectionReason}
               </p>
+            )}
+            {canBeWindowFallback(t.body) && (
+              <div className="mt-3 space-y-1">
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={t.isWindowFallback}
+                    disabled={fallbackBusy !== null}
+                    onChange={(e) => void toggleFallback(t, e.target.checked)}
+                    className="accent-primary"
+                  />
+                  Usar para mensajes fuera de 24 h: lo que escribas en el chat
+                  con la ventana cerrada se envía como {"{{1}}"} de esta
+                  plantilla.
+                </label>
+                {t.isWindowFallback && t.status !== "approved" && (
+                  <p className="text-xs text-warning-text">
+                    Se usará en cuanto Meta la apruebe.
+                  </p>
+                )}
+                {t.isWindowFallback && t.category === "MARKETING" && (
+                  <p className="text-xs text-warning-text">
+                    Meta la clasificó como MARKETING: cada conversación que
+                    reabra se cobra a tarifa de marketing.
+                  </p>
+                )}
+              </div>
             )}
           </div>
         ))}
@@ -225,7 +287,7 @@ function CreateForm({ onCreated }: { onCreated: () => void }) {
             variableCount > 0 && (
               <p className="text-xs text-muted-foreground">
                 {variableCount === 1
-                  ? "1 variable: al enviar pedirá su valor."
+                  ? "1 variable: al enviar pedirá su valor. Puedes marcarla como genérica para escribir libremente en chats con la ventana cerrada."
                   : `${variableCount} variables: al enviar pedirá los ${variableCount} valores.`}
               </p>
             )

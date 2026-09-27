@@ -309,7 +309,11 @@ export async function POST(req: Request, ctx: Params) {
       );
     }
     const tpl: MockTemplate = {
-      id: `tplmock_${nextN()}`,
+      // El contador del mock vuelve a empezar con cada reinicio del servidor,
+      // pero los `wa_template_id` ya guardados en la BD sobreviven: sin el
+      // sufijo de tiempo, una plantilla nueva heredaba el id de una vieja y
+      // el sync actualizaba la equivocada. Meta nunca repite ids.
+      id: `tplmock_${Date.now().toString(36)}_${nextN()}`,
       name: String(body.name ?? ""),
       language: String(body.language ?? "es_MX"),
       category: String(body.category ?? "UTILITY"),

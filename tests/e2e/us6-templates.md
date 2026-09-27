@@ -66,3 +66,39 @@ modo agencia no es el de esta instancia: sin pull, la plantilla se queda
     132000 de Meta si el número de parámetros no cuadra.
 14. Compatibilidad: el payload viejo `{ templateId, variable }` (una variable)
     sigue enviando — lo usa el cron de recordatorios de sesión.
+
+## Plantilla genérica fuera de ventana (2026-09-27)
+
+> Automatizado en `scripts/e2e-selftest.mjs` (`plantillaGenericaChecks`, 22
+> checks) + UI con el navegador. Con la ventana de 24 h cerrada, lo que el
+> operador escribe en el chat sale como `{{1}}` de la plantilla marcada como
+> genérica — sin elegir plantilla ni llenar campos.
+
+15. Crear `aviso_general` con cuerpo
+    `Dando seguimiento a la cita agendada.\n{{1}}\n\nSaludos!`.
+    ✅ Nace sin marca de genérica.
+    ✅ Un cuerpo que **empieza o termina** en variable → 422 (Meta lo rechaza);
+    la pantalla lo avisa antes de gastar la llamada.
+16. `PATCH /api/templates/:id { isWindowFallback: true }` (casilla "Usar para
+    mensajes fuera de 24 h" en `/settings/templates`).
+    ✅ Solo plantillas de **exactamente una variable** (otra → 422).
+    ✅ A lo más una por organización: marcar B desmarca A (índice único parcial
+    `template_org_window_fallback_uq`).
+    ✅ La marca es local: aprobar/sincronizar con Meta no la toca.
+17. Conversación con la ventana cerrada (contacto capturado a mano).
+    ✅ El texto libre sigue prohibido en el núcleo: `POST …/messages` → 409
+    `window_closed`.
+    ✅ El composer muestra el campo de texto normal con el aviso "se enviará
+    dentro de la plantilla…", vista previa y contador (1024 del cuerpo ya
+    renderizado). Adjuntos/ubicación/contacto no aplican.
+18. Escribir "Le recuerdo que tiene una cita agendada⏎para mañana a las 10 am"
+    y enviar.
+    ✅ El outbox del wa-mock trae `type: "template"`, el nombre de la genérica y
+    `parameters[0].text` **en un solo renglón** (Meta 132018 rechaza saltos,
+    tabs y más de 4 espacios en un parámetro; se sanea siempre, en toda
+    plantilla).
+    ✅ El hilo muestra la plantilla completa ya sustituida.
+19. Caminos infelices: cuerpo renderizado > 1024 → 422 diciendo cuánto sobra;
+    solo espacios/saltos → 422 (valor faltante). Sin genérica aprobada, el
+    composer vuelve al selector de siempre con la pista de cómo activarla;
+    "Usar otra plantilla" abre ese mismo selector.

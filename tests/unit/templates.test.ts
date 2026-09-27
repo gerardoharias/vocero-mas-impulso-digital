@@ -4,6 +4,7 @@ import {
   renderBody,
   validateBodyVariables,
 } from "@/server/whatsapp/templates";
+import { canBeWindowFallback, sanitizeTemplateParam } from "@/lib/templates";
 
 describe("countVariables / validateBodyVariables (FR-050)", () => {
   it("sin variables → 0, válido", () => {
@@ -64,5 +65,61 @@ describe("renderBody", () => {
   it("sin valores → variables vacías", () => {
     expect(renderBody("Hola {{1}}!")).toBe("Hola !");
     expect(renderBody("Hola {{1}} el {{2}}", ["María"])).toBe("Hola María el ");
+  });
+});
+
+describe("validateBodyVariables — posición de la variable", () => {
+  it("variable al inicio → inválida (Meta la rechaza)", () => {
+    expect(validateBodyVariables("{{1}}, te esperamos mañana.")).toMatch(
+      /empezar con una variable/
+    );
+  });
+
+  it("variable al final → inválida, aunque haya espacios o saltos detrás", () => {
+    expect(validateBodyVariables("Hola, te esperamos a las {{1}}")).toMatch(
+      /terminar con una variable/
+    );
+    expect(validateBodyVariables("Hola {{1}}\n\n")).toMatch(
+      /terminar con una variable/
+    );
+  });
+
+  it("la genérica de la captura (texto antes y después) → válida", () => {
+    const body = "Dando seguimiento a la cita agendada.\n{{1}}\n\nSaludos!";
+    expect(validateBodyVariables(body)).toBeNull();
+  });
+});
+
+describe("sanitizeTemplateParam (Meta 132018)", () => {
+  it("aplana saltos de línea y tabuladores a un espacio", () => {
+    expect(
+      sanitizeTemplateParam("Le recuerdo su cita\npara mañana\r\n\ta las 10 am")
+    ).toBe("Le recuerdo su cita para mañana a las 10 am");
+  });
+
+  it("junta espacios repetidos (Meta no acepta más de 4 seguidos) y recorta", () => {
+    expect(sanitizeTemplateParam("  hola      mundo  ")).toBe("hola mundo");
+  });
+
+  it("no toca emojis ni acentos", () => {
+    expect(sanitizeTemplateParam("¡Nos vemos! 😊 Señor Núñez")).toBe(
+      "¡Nos vemos! 😊 Señor Núñez"
+    );
+  });
+
+  it("solo espacios → vacío (el envío lo trata como valor faltante)", () => {
+    expect(sanitizeTemplateParam(" \n\t ")).toBe("");
+  });
+});
+
+describe("canBeWindowFallback", () => {
+  it("exactamente una variable → puede ser la genérica", () => {
+    expect(canBeWindowFallback("Seguimiento.\n{{1}}\nSaludos!")).toBe(true);
+    expect(canBeWindowFallback("Hola {{1}}, ¿confirmas, {{1}}?")).toBe(true);
+  });
+
+  it("cero o varias variables → no", () => {
+    expect(canBeWindowFallback("Seguimos disponibles.")).toBe(false);
+    expect(canBeWindowFallback("Hola {{1}}, el {{2}}.")).toBe(false);
   });
 });

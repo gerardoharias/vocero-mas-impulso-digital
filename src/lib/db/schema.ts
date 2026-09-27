@@ -789,6 +789,13 @@ export const template = pgTable(
       .default("draft"),
     rejectionReason: text("rejection_reason"),
     waTemplateId: text("wa_template_id"),
+    /**
+     * Plantilla genérica: con la ventana de 24 h cerrada, lo que el operador
+     * escribe en el chat sale envuelto en ésta como su única variable `{{1}}`.
+     * Es una marca LOCAL — Meta no la ve, así que cambiarla no pide volver a
+     * aprobar nada.
+     */
+    isWindowFallback: boolean("is_window_fallback").notNull().default(false),
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
@@ -798,6 +805,11 @@ export const template = pgTable(
       t.name,
       t.language
     ),
+    // A lo más UNA genérica por organización, garantizado por la base: dos
+    // pestañas marcando plantillas distintas a la vez no pueden ganar las dos.
+    uniqueIndex("template_org_window_fallback_uq")
+      .on(t.organizationId)
+      .where(sql`${t.isWindowFallback} = true`),
   ]
 );
 

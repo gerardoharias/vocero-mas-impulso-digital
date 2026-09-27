@@ -1,0 +1,2 @@
+ALTER TABLE "template" ADD COLUMN "is_window_fallback" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "template_org_window_fallback_uq" ON "template" USING btree ("organization_id") WHERE "template"."is_window_fallback" = true;

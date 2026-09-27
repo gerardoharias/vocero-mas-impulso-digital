@@ -79,6 +79,8 @@ export type TemplateDto = {
   body: string;
   status: "draft" | "pending" | "approved" | "rejected";
   rejectionReason: string | null;
+  /** La genérica: envuelve lo que se escribe con la ventana cerrada. */
+  isWindowFallback: boolean;
 };
 
 export type StageDto = {

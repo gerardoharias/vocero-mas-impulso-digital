@@ -35,6 +35,8 @@ const DESCRIPTIONS: Record<number, string> = {
     "El contenido de la plantilla viola las políticas de Meta.",
   132012:
     "Los parámetros de la plantilla no respetan el formato que Meta espera.",
+  132018:
+    "Un valor de la plantilla lleva saltos de línea, tabuladores o más de 4 espacios seguidos, y Meta no los acepta en un parámetro.",
   132015:
     "La plantilla está pausada por baja calidad: Meta no la deja enviar hasta que se recupere.",
   132016:
