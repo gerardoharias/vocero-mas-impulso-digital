@@ -10,6 +10,7 @@ import {
   type AvailableSlot,
 } from "@/server/agenda/availability";
 import { getSettings, type CalendarSettings } from "@/server/agenda/settings";
+import { nearestSlots } from "@/server/agenda/alternatives";
 import {
   clearOffers,
   findOffered,
@@ -127,10 +128,20 @@ export async function createSessionBooking(input: {
    * contacto se bloquea, sin importar el instante que se pida.
    */
   allowAdditional?: boolean;
+  /**
+   * 024 — ¿Registrar YA las alternativas como la nueva oferta (`active`) cuando
+   * el hueco se ocupó? Por omisión sí: es lo que espera el cerebro externo
+   * (`/api/bot/bookings`), que las muestra por su cuenta. El agente integrado
+   * pasa `false`: su re-oferta es un MENSAJE, y sus horarios no pueden ser
+   * seleccionables antes de que Meta lo acepte; los persiste `sendText` como
+   * `pending` junto con el mensaje (spec 024 §5.7).
+   */
+  registerAlternatives?: boolean;
   now?: Date;
 }): Promise<BookingResult> {
   const db = getDb();
   const settings = await getSettings(input.organizationId);
+  const register = input.registerAlternatives !== false;
 
   if (Number.isNaN(Date.parse(input.startUtc))) {
     throw new BookingError("invalid", "Instante inválido");
@@ -248,6 +259,8 @@ export async function createSessionBooking(input: {
       "Ese horario ya no está disponible",
       await refreshOffer(input.organizationId, input.conversationId, {
         now: input.now,
+        register,
+        target: { startUtc: input.startUtc, timezone: settings.timezone },
       })
     );
   }
@@ -327,6 +340,8 @@ export async function createSessionBooking(input: {
       "Ese horario acaba de ocuparse",
       await refreshOffer(input.organizationId, input.conversationId, {
         now: input.now,
+        register,
+        target: { startUtc: input.startUtc, timezone: settings.timezone },
       })
     );
   }
@@ -776,18 +791,26 @@ async function withConnector(
  * Alternativas frescas para re-ofrecer. Si hay conversación, quedan
  * REGISTRADAS como su nueva oferta: el cliente puede aceptar una de inmediato
  * y la validación seguirá siendo válida.
+ *
+ * 024 §5.7: `register: false` (el agente integrado) sólo las CALCULA; sus
+ * horarios viajan con el mensaje y nacen `pending` hasta que Meta lo acepta.
  */
 async function refreshOffer(
   organizationId: string,
   conversationId: string | null | undefined,
-  opts: { now?: Date }
+  opts: {
+    now?: Date;
+    register?: boolean;
+    /** 025: lo que el prospecto pidió; las alternativas se eligen CERCA de eso. */
+    target?: { startUtc: string; timezone: string };
+  }
 ): Promise<OfferedSlot[]> {
   let fresh: AvailableSlot[] = [];
   try {
-    fresh = (await computeAvailability(organizationId, { now: opts.now })).slice(
-      0,
-      FRESH_ALTERNATIVES
-    );
+    const all = await computeAvailability(organizationId, { now: opts.now });
+    fresh = opts.target
+      ? nearestSlots(all, opts.target.startUtc, opts.target.timezone, FRESH_ALTERNATIVES)
+      : all.slice(0, FRESH_ALTERNATIVES);
   } catch (err) {
     console.warn(`[agenda] no pude calcular alternativas: ${err}`);
     return [];
@@ -803,7 +826,7 @@ async function refreshOffer(
     startUtc: s.startUtc,
     label: tz ? labelInTz(s.startUtc, tz, { hour12: true }) : s.label,
   }));
-  if (conversationId && offers.length > 0) {
+  if (opts.register !== false && conversationId && offers.length > 0) {
     await replaceOffers(organizationId, conversationId, offers).catch((err) => {
       console.warn(`[agenda] no pude registrar la nueva oferta: ${err}`);
     });

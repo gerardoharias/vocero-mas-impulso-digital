@@ -3,15 +3,35 @@ import { getDb, schema } from "@/lib/db";
 import { newId } from "@/lib/db/ids";
 import { scoped } from "@/lib/db/tenant";
 import { moveLeadToStage as moveLeadThroughHistory } from "@/server/leads/stage-history";
-import { getEnv } from "@/lib/env";
-import { chatJson, type ChatMessage } from "@/lib/ai";
-import { resolveAiConfig } from "@/server/ai/credentials";
+import { aiFallbackMessage, getEnv } from "@/lib/env";
+import { chatJson, type ChatJsonResult, type ChatMessage } from "@/lib/ai";
+import { createCallBudget, type CallBudget } from "@/lib/ai/budget";
+import { resolveEffectiveModel } from "@/lib/ai/config";
+import { errorClass } from "@/lib/ai/errors";
+import { describeError, logAi } from "@/lib/ai/log";
+import { markAiError, resolveAiConfig } from "@/server/ai/credentials";
+import {
+  CIRCUIT,
+  circuitCheck,
+  circuitRecordFailure,
+  circuitRecordSuccess,
+  countsTowardCircuit,
+  type CircuitGate,
+} from "@/server/ai/circuit";
+import {
+  CONSECUTIVE_FORMAT_FAILURES_LIMIT,
+  circuitNoticeRecent,
+  markCircuitNotice,
+  recordFormatFailure,
+  resetFailureState,
+} from "@/server/ai/failure-state";
 import { publish } from "@/server/events/bus";
 import { isWindowOpen } from "@/server/inbox/window";
 import { SendError, sendText } from "@/server/inbox/send";
 import {
   agentActionSchema,
   degradeAction,
+  normalizeAgentAction,
   resolveStage,
   type AgentActionType,
 } from "@/server/ai/actions";
@@ -21,17 +41,38 @@ import { markReadAndTyping, TYPING_TTL_MS } from "@/server/whatsapp/presence";
 import {
   buildAgendaNowMessage,
   buildAgentSystemPrompt,
+  rulesBlockOf,
 } from "@/server/ai/prompts";
-import { salvageProse } from "@/server/ai/salvage";
+import { recoverPlainText } from "@/server/ai/recovery";
 import { agendaEnabled } from "@/server/agenda/flag";
 import {
   bookSlot,
+  checkAvailability,
   offerSlots,
   readAgendaState,
   readBusinessHours,
   recordRescheduleRequest,
+  type AgendaTurn,
 } from "@/server/agenda/agent";
-import { getOffers, offerDays } from "@/server/agenda/offers";
+import { claimsNoAvailability } from "@/server/agenda/availability-query";
+import { guardAgendaAction } from "@/server/agenda/query-intent";
+import {
+  isUnambiguousTopicChange,
+  mergeClarifyContext,
+  nextAttemptNumber,
+  recordUnresolvedAttempt,
+} from "@/server/agenda/agenda-clarify-context";
+import {
+  loadAgendaClarifyState,
+  resetAgendaClarifyState,
+  writeAgendaClarifyState,
+} from "@/server/agenda/agenda-clarify-state";
+import {
+  getOffers,
+  offerDays,
+  replaceOffers,
+  type OfferedSlot,
+} from "@/server/agenda/offers";
 import { awaitMediaJob } from "@/server/whatsapp/media";
 import { recordAiNote } from "@/server/contacts/notes";
 
@@ -91,7 +132,9 @@ async function executeTurn(conversationId: string): Promise<void> {
   try {
     await runAgentTurn(conversationId);
   } catch (err) {
-    console.error("[agente] turno falló:", err);
+    // Sólo nombre/código: el mensaje de un error de BD o de Meta puede traer
+    // parámetros con el texto o el teléfono del cliente.
+    console.error(`[agente] turno falló: ${describeError(err)}`);
   } finally {
     entry.running = false;
     if (entry.pending) {
@@ -290,6 +333,23 @@ export async function runAgentTurn(
   const lastInbound = [...history].reverse().find((m) => m.direction === "in");
   if (!lastInbound) return;
 
+  // 024 (G5) — Un turno, una respuesta lógica. La respuesta a este entrante
+  // lleva una clave única: si ya existe (el turno se re-ejecutó tras un
+  // reinicio, o corrió dos veces), NO se vuelve a llamar al modelo ni a la
+  // agenda. El Laboratorio no la usa (sus mensajes nunca salen). Esa respuesta
+  // es más NUEVA que el entrante, así que ya viene en el historial de arriba
+  // (sin otra consulta); la restricción UNIQUE de `message.dedupe_key` es la
+  // garantía dura si dos turnos corrieran a la vez.
+  const turnKey = conversation.isTest ? undefined : `agent-turn:${lastInbound.id}`;
+  if (turnKey && history.some((m) => m.dedupeKey === turnKey)) {
+    logAi("info", {
+      event: "turn_outcome",
+      traceId: conversation.id,
+      outcome: "already_answered",
+    });
+    return;
+  }
+
   // Ventana cerrada: el agente JAMÁS envía texto libre → handoff 'ventana'.
   if (!conversation.isTest && !isWindowOpen(conversation.lastInboundAt)) {
     await escalate(conversation, "ventana");
@@ -350,17 +410,15 @@ export async function runAgentTurn(
       ? offerDays(offers, businessHours.timezone, new Date())
       : undefined,
   });
+  const systemPrompt = buildAgentSystemPrompt({
+    profile,
+    kb,
+    stages,
+    agenda,
+    businessHours,
+  });
   const messages: ChatMessage[] = [
-    {
-      role: "system",
-      content: buildAgentSystemPrompt({
-        profile,
-        kb,
-        stages,
-        agenda,
-        businessHours,
-      }),
-    },
+    { role: "system", content: systemPrompt },
     ...(await historyAsChatMessages(history)),
     // El estado de AHORA va DESPUÉS del historial: es lo único que cambia
     // entre turnos y lo único que tiene que ganarle a lo que el propio agente
@@ -380,73 +438,206 @@ export async function runAgentTurn(
   });
 
   const aiConfig = await resolveAiConfig(organizationId);
-  const result = await chatJson(agentActionSchema(agenda), messages, aiConfig);
-  if (!result.ok) {
-    if (result.error === "not_configured") return;
+  const model = resolveEffectiveModel({ model: aiConfig.model });
 
-    // Red de rescate: si el proveedor llegó a producir texto utilizable pero
-    // sin envolverlo en JSON, se entrega como respuesta en vez de escalar.
-    // Un hipo de FORMATO no puede costar una respuesta que el modelo ya dio
-    // (incidente del 2026-09-19). Un fallo REAL del proveedor no trae texto
-    // que rescatar, así que sigue escalando por el camino de abajo.
-    const rescatado = salvageProse(result.raw);
-    if (rescatado) {
-      console.warn(
-        `[agente] el proveedor no devolvió JSON; se rescata su texto (conv ${conversationId}): ${result.detail}`
-      );
-      try {
-        await deliverReply(conversation, rescatado);
-        return;
-      } catch (err) {
-        // El rescate no se pudo entregar: NO nos quedamos callados, se escala.
-        console.error(`[agente] el texto rescatado no se pudo entregar: ${err}`);
-      }
+  // Circuito de protección (spec 023 §3.7): si esta organización+modelo tiene
+  // una falla GLOBAL en curso, este turno no gasta llamadas ni hace handoff.
+  if (model) {
+    const gate = circuitCheck(organizationId, model);
+    if (!gate.allow) {
+      await handleCircuitOpen(conversation, model, gate, turnKey);
+      return;
     }
-
-    // Fallo persistente del proveedor o salida imposible → escalar (FR-022).
-    console.error(`[agente] fallo del proveedor (raw): ${result.detail}`);
-    await escalate(conversation, "error");
-    return;
   }
 
-  let action: AgentActionType = result.data;
+  // UN presupuesto por turno, compartido por reintentos, escalera de formato,
+  // corrección y recuperación de texto plano (spec 023 I1: ≤ 3 llamadas).
+  const budget = createCallBudget();
+  const result = await chatJson(agentActionSchema(agenda), messages, {
+    ...aiConfig,
+    traceId: conversationId,
+    schemaName: "accion_agente",
+    budget,
+    // El texto plano (invalid_json) lo maneja la recuperación segura de abajo,
+    // no una corrección genérica: ver spec 023 §3.4.
+    correct: { invalidJson: false },
+    // 025 rev.: `""`/`[]` = ausencia, ANTES de validar el esquema.
+    normalize: normalizeAgentAction,
+  });
 
-  // 015 — Agenda. Un fallo del motor degrada el turno (el agente responde sin
+  let action: AgentActionType;
+  if (result.ok) {
+    action = result.data;
+    if (model) circuitRecordSuccess(organizationId, model);
+    await clearFailureState(conversation);
+  } else {
+    const handled = await handleModelFailure({
+      result,
+      conversation,
+      model,
+      budget,
+      rulesText: rulesBlockOf(systemPrompt),
+      aiConfig,
+      turnKey,
+    });
+    if (!handled) return;
+    action = handled;
+  }
+
+  // 026 — texto del cliente desde la última respuesta (se usa para la compuerta
+  // de agenda, la fusión de contexto de aclaración y la detección de cambio de
+  // tema). Se calcula UNA vez, siempre, aunque esta instancia no tenga agenda.
+  const lastOut = history.map((m) => m.direction).lastIndexOf("out");
+  const customerText = history
+    .slice(lastOut + 1)
+    .filter((m) => m.direction === "in" && m.text)
+    .map((m) => m.text as string)
+    .join(" ");
+  // 026 — memoria de aclaración de disponibilidad, cargada de la fila YA leída
+  // de `conversation` (sin otra consulta): 0/null/null si no hay nada pendiente.
+  const clarifyState = loadAgendaClarifyState(conversation);
+
+  // 025 (rev. correctiva) — La compuerta de las acciones de agenda, con lo que el
+  // CLIENTE escribió en este turno: `edge` sólo si lo pidió con esas palabras,
+  // vacíos = ausencia, y `offer_slots` con un día/fecha/hora/rango en el mensaje
+  // ES `check_availability` (aunque el perfil del negocio diga «usa offer_slots»).
+  // No cambia nada más.
+  if (agenda && (action.action === "offer_slots" || action.action === "check_availability")) {
+    const guarded = guardAgendaAction(action, customerText);
+    if (guarded.changes.length > 0) {
+      action = guarded.action;
+      logAi("info", {
+        event: "action_guard",
+        traceId: conversationId,
+        outcome: guarded.changes.join("+"),
+      });
+    }
+  }
+
+  // 026 (regla 11-b) — Una aclaración de disponibilidad pendiente NO se limpia
+  // sólo porque el modelo haya elegido, ESTE turno, una acción no relacionada
+  // con agenda (eso solo no basta): hace falta ADEMÁS una señal determinista de
+  // cambio de tema (`isUnambiguousTopicChange`, servidor). Si hay duda, se
+  // conserva — un falso positivo sólo hace que se pregunte de más, nunca que
+  // se invente disponibilidad.
+  if (
+    agenda &&
+    clarifyState.count > 0 &&
+    action.action !== "check_availability" &&
+    action.action !== "offer_slots" &&
+    action.action !== "book_slot" &&
+    isUnambiguousTopicChange(customerText)
+  ) {
+    await resetAgendaClarifyState(conversation);
+    clarifyState.count = 0;
+    clarifyState.kind = null;
+    clarifyState.context = null;
+  }
+
+  // 015 — Agenda. Un fallo del MOTOR degrada el turno (el agente responde sin
   // agendar), nunca lo tumba: quedarse callado es peor que no agendar.
-  if (action.action === "offer_slots" || action.action === "book_slot") {
+  //
+  // 024 (G1, G7) — SÓLO el motor va dentro del `try`. Antes, el envío también
+  // estaba ahí: un rechazo temporal de Meta se confundía con "el motor falló",
+  // `degradeAction` convertía `offer_slots` en la introducción sola y ESO era lo
+  // que llegaba al prospecto (incidente 2026-09). Con el payload ya armado,
+  // nada lo reconstruye ni lo sustituye: si el envío falla, el mensaje —íntegro—
+  // queda en el outbox (reintento, `delivery_unknown` o `failed`).
+  if (
+    action.action === "offer_slots" ||
+    action.action === "book_slot" ||
+    action.action === "check_availability"
+  ) {
     if (!agenda) {
       action = degradeAction(action);
     } else {
+      let turn: AgendaTurn | null = null;
       try {
-        const turn =
+        turn =
           action.action === "offer_slots"
             ? await offerSlots({
                 organizationId,
                 conversationId,
                 intro: action.reply,
-                // Sin esto el motor no se entera de qué día pidió el cliente
-                // y devuelve siempre lo mismo (incidente 2026-09-20).
-                day: action.day,
               })
-            : await bookSlot({
-                organizationId,
-                conversationId,
-                startUtc: action.startUtc,
-                confirmation: action.reply,
-                reason: action.reason,
-                confirmAdditional: action.confirmAdditional,
-              });
-        await deliverReply(conversation, turn.text);
-        if (turn.ok) {
+            : action.action === "check_availability"
+              ? await (() => {
+                  // 026 — el turno actual manda; el contexto de una aclaración
+                  // pendiente sólo RELLENA lo que falte (regla 10).
+                  const merged = mergeClarifyContext(
+                    clarifyState.context,
+                    { day: action.day, days: action.days, times: action.times, from: action.from, to: action.to, edge: action.edge },
+                    customerText
+                  );
+                  return checkAvailability({
+                    organizationId,
+                    conversationId,
+                    query: merged.query,
+                    impliedWeekModifier: merged.impliedWeekModifier,
+                    priorClarifyAttempt: nextAttemptNumber(clarifyState),
+                  });
+                })()
+              : await bookSlot({
+                  organizationId,
+                  conversationId,
+                  startUtc: action.startUtc,
+                  confirmation: action.reply,
+                  reason: action.reason,
+                  confirmAdditional: action.confirmAdditional,
+                });
+      } catch (err) {
+        console.error(`[agente] el motor de agenda falló: ${describeError(err)}`);
+        // Sin `reply` que degradar: un texto fijo, sin afirmar nada de horarios.
+        action =
+          action.action === "check_availability"
+            ? {
+                action: "reply",
+                text: "Tuve un problema al revisar la agenda. Lo confirmo con el equipo y te aviso por aquí.",
+              }
+            : degradeAction(action);
+      }
+      if (turn) {
+        // 026 — memoria de aclaración: se actualiza ANTES de enviar, para que
+        // un fallo de envío no deje el contador desincronizado del texto que
+        // (con suerte) sí llegó en el reintento del outbox.
+        let escalatedToHandoff = false;
+        if (action.action === "check_availability" && turn.status === "availability_clarify" && turn.clarify) {
+          const outcome = recordUnresolvedAttempt(clarifyState, turn.clarify.reason, turn.clarify.context);
+          await writeAgendaClarifyState(conversation, clarifyState.count, outcome.state);
+          if (outcome.escalate) {
+            escalatedToHandoff = true;
+            turn = {
+              ...turn,
+              text: "No logro ubicar bien la fecha después de varios intentos. Ya avisé al equipo para que te ayude directamente por aquí.",
+            };
+          }
+        } else if (clarifyState.count > 0) {
+          await resetAgendaClarifyState(conversation);
+        }
+
+        try {
+          await deliverReply(conversation, turn.text, {
+            turnKey,
+            offers: turn.offers,
+          });
+        } catch (err) {
+          // El fallo de envío ya quedó registrado en el mensaje (con su
+          // estado y su payload íntegro). No hay nada que sustituir.
+          console.error(
+            `[agente] respuesta de agenda no entregada: ${describeError(err)}`
+          );
+        }
+        if (escalatedToHandoff) {
+          // 026 regla 15 — tres aclaraciones consecutivas sin resolver: se
+          // deriva a un humano en vez de volver a preguntar.
+          await applyHandoff(conversationId, organizationId, "agenda_ambigua");
+        } else if (turn.ok) {
           publish(organizationId, {
             type: "conversation.updated",
             data: { conversation: { id: conversationId } },
           });
         }
         return;
-      } catch (err) {
-        console.error(`[agente] el motor de agenda falló: ${err}`);
-        action = degradeAction(action);
       }
     }
   }
@@ -470,10 +661,12 @@ export async function runAgentTurn(
       });
       await applyHandoff(conversationId, organizationId, "reprogramacion");
       try {
-        await deliverReply(conversation, action.reply?.trim() || turn.text);
+        await deliverReply(conversation, action.reply?.trim() || turn.text, {
+          turnKey,
+        });
       } catch (err) {
         console.error(
-          `[agente] traspaso por reprogramación aplicado pero el aviso no se pudo enviar: ${err}`
+          `[agente] traspaso por reprogramación aplicado pero el aviso no se pudo enviar: ${describeError(err)}`
         );
       }
       return;
@@ -491,7 +684,7 @@ export async function runAgentTurn(
         data: { conversation: { id: conversationId } },
       });
       if (action.reply) {
-        await deliverReply(conversation, action.reply);
+        await deliverReply(conversation, action.reply, { turnKey });
       }
       return;
     }
@@ -500,9 +693,30 @@ export async function runAgentTurn(
   switch (action.action) {
     case "none":
       return;
-    case "reply":
-      await deliverReply(conversation, action.text);
+    case "reply": {
+      // 025 §5.4 — una NEGACIÓN de agenda escrita por el modelo («no tengo
+      // horarios»), que sólo vio una lista parcial, no se envía: se sustituye por
+      // lo que el motor dice de verdad (que puede ser, con evidencia, que no hay).
+      if (agenda && claimsNoAvailability(action.text)) {
+        let real: AgendaTurn | null = null;
+        try {
+          real = await checkAvailability({ organizationId, conversationId, query: {} });
+        } catch (err) {
+          console.error(`[agente] no pude verificar la agenda: ${describeError(err)}`);
+        }
+        if (real) {
+          logAi("warn", {
+            event: "turn_outcome",
+            traceId: conversation.id,
+            outcome: "availability_claim_replaced",
+          });
+          await deliverReply(conversation, real.text, { turnKey, offers: real.offers });
+          return;
+        }
+      }
+      await deliverReply(conversation, action.text, { turnKey });
       return;
+    }
     case "update_lead": {
       await recordAiNote({
         organizationId,
@@ -512,7 +726,7 @@ export async function runAgentTurn(
         isTest: conversation.isTest,
         sourceMessageId: lastInbound.id,
       });
-      if (action.reply) await deliverReply(conversation, action.reply);
+      if (action.reply) await deliverReply(conversation, action.reply, { turnKey });
       return;
     }
     case "handoff": {
@@ -533,13 +747,207 @@ export async function runAgentTurn(
 
 type Conversation = typeof schema.conversation.$inferSelect;
 
-/** Entrega la respuesta: envío real o persistencia sandbox (is_test). */
+/** Un turno con acción válida reinicia el conteo de fallos de la conversación (sin fallar el turno). */
+async function clearFailureState(conversation: Conversation): Promise<void> {
+  if (!(conversation.aiFailCount > 0) && !conversation.aiFailKind) return;
+  try {
+    await resetFailureState(conversation);
+  } catch (err) {
+    console.error(
+      `[agente] no se pudo reiniciar el estado de fallos: ${describeError(err)}`
+    );
+  }
+}
+
+/**
+ * Qué hacer cuando `chatJson` no entregó una acción válida (spec 023 §3.5).
+ * Devuelve la acción a ejecutar (sólo `reply`, recuperado de texto plano) o
+ * `null` si el turno ya quedó resuelto aquí (silencio, degradación o handoff).
+ *
+ * La clase del fallo decide — nunca el texto de un mensaje:
+ * - config/transporte persistente → handoff "error" (política de siempre) y
+ *   cuenta para el circuito de protección;
+ * - formato → NO es un fallo del proveedor: recuperación de texto plano, o
+ *   mensaje fijo de degradación, con la IA activa y la conversación viva.
+ */
+async function handleModelFailure(input: {
+  result: Extract<ChatJsonResult<unknown>, { ok: false }>;
+  conversation: Conversation;
+  model: string | null;
+  budget: CallBudget;
+  rulesText: string;
+  aiConfig: { apiToken?: string; model?: string };
+  turnKey?: string;
+}): Promise<AgentActionType | null> {
+  const { result, conversation, model } = input;
+  const traceId = conversation.id;
+  if (result.error === "not_configured") return null;
+
+  if (errorClass(result.error) !== "format") {
+    // Fallo persistente del proveedor o incompatibilidad de configuración.
+    let circuitOpened = false;
+    if (model && countsTowardCircuit(result.error)) {
+      circuitOpened = circuitRecordFailure(
+        conversation.organizationId,
+        model,
+        conversation.id,
+        result.error
+      ).opened;
+    }
+    if (result.error === "unauthorized") {
+      // Señal visible en Ajustes → IA (no-op si la org usa el token del entorno).
+      try {
+        await markAiError(conversation.organizationId);
+      } catch (err) {
+        console.error(
+          `[agente] no se pudo marcar la conexión de IA: ${describeError(err)}`
+        );
+      }
+    }
+    logAi("error", {
+      event: "turn_outcome",
+      traceId,
+      org: conversation.organizationId,
+      model: model ?? undefined,
+      code: result.error,
+      status: result.status,
+      outcome: circuitOpened ? "handoff_error_circuit_opened" : "handoff_error",
+    });
+    await applyHandoff(conversation.id, conversation.organizationId, "error");
+    return null;
+  }
+
+  // El proveedor respondió: transporte y configuración funcionan (cierra una
+  // racha o un turno de prueba del circuito). El formato es por mensaje.
+  if (model) circuitRecordSuccess(conversation.organizationId, model);
+
+  // Sólo si el borrador es la respuesta ORIGINAL del modelo (no la de una
+  // corrección) y QUEDA presupuesto: 1 principal + 1 corrección O 1 principal
+  // + 1 recuperación, dentro del tope de 3 llamadas por turno.
+  if (
+    result.error === "invalid_json" &&
+    result.draft &&
+    !result.meta?.corrected
+  ) {
+    const recovered = await recoverPlainText({
+      draft: result.draft,
+      rulesText: input.rulesText,
+      aiConfig: input.aiConfig,
+      traceId,
+      budget: input.budget,
+    });
+    if (recovered.ok) {
+      logAi("info", {
+        event: "turn_outcome",
+        traceId,
+        outcome: "reply",
+        recovered: "plain_text",
+      });
+      await clearFailureState(conversation);
+      return { action: "reply", text: recovered.text };
+    }
+  }
+
+  await degradeTurn(conversation, result.error, input.turnKey);
+  return null;
+}
+
+/**
+ * Degradación segura de un fallo de FORMATO: un mensaje fijo, sin promesas, y
+ * la IA sigue activa. El conteo de fallos consecutivos vive en la base
+ * (`recordFormatFailure`, atómico) y NO depende del texto que vio el cliente:
+ * al segundo consecutivo el fallo ya no es aislado → handoff "error", sin
+ * decirle nada más al cliente.
+ */
+async function degradeTurn(
+  conversation: Conversation,
+  code: string,
+  turnKey?: string
+): Promise<void> {
+  let consecutive = 1;
+  try {
+    consecutive = await recordFormatFailure(conversation, code);
+  } catch (err) {
+    // Sin el contador se degrada (lo seguro): nunca se escala a ciegas.
+    console.error(
+      `[agente] no se pudo registrar el fallo de formato: ${describeError(err)}`
+    );
+  }
+  if (consecutive >= CONSECUTIVE_FORMAT_FAILURES_LIMIT) {
+    logAi("error", {
+      event: "turn_outcome",
+      traceId: conversation.id,
+      code,
+      failures: consecutive,
+      outcome: "handoff_error_consecutive",
+    });
+    await applyHandoff(conversation.id, conversation.organizationId, "error");
+    return;
+  }
+  logAi("warn", {
+    event: "turn_outcome",
+    traceId: conversation.id,
+    code,
+    failures: consecutive,
+    outcome: "degraded",
+  });
+  try {
+    await deliverReply(conversation, aiFallbackMessage(), { turnKey });
+  } catch (err) {
+    console.error(
+      `[agente] mensaje de degradación no enviado: ${describeError(err)}`
+    );
+  }
+}
+
+/**
+ * Circuito abierto: sin llamadas al proveedor y SIN handoff (la IA sigue
+ * activa: la conversación es recuperable cuando el circuito cierre). El cliente
+ * recibe UNA vez por periodo el mensaje fijo de degradación — que no promete un
+ * humano, porque no se creó ningún handoff.
+ */
+async function handleCircuitOpen(
+  conversation: Conversation,
+  model: string,
+  gate: Extract<CircuitGate, { allow: false }>,
+  turnKey?: string
+): Promise<void> {
+  logAi("warn", {
+    event: "circuit_blocked",
+    traceId: conversation.id,
+    org: conversation.organizationId,
+    model,
+    code: gate.code,
+  });
+  if (circuitNoticeRecent(conversation, CIRCUIT.baseCooldownMs)) return;
+  try {
+    await deliverReply(conversation, aiFallbackMessage(), { turnKey });
+    await markCircuitNotice(conversation);
+  } catch (err) {
+    console.error(
+      `[agente] aviso de circuito no enviado: ${describeError(err)}`
+    );
+  }
+}
+
+/**
+ * Entrega la respuesta: envío real o persistencia sandbox (is_test).
+ *
+ * 024 — `turnKey` hace única la respuesta del turno y `offers` son los horarios
+ * que el texto muestra: se persisten con el mensaje y se activan cuando Meta lo
+ * acepta. Un fallo RECUPERABLE de Meta no lanza: el mensaje queda en el outbox.
+ */
 async function deliverReply(
   conversation: Conversation,
-  text: string
+  text: string,
+  ctx: { turnKey?: string; offers?: OfferedSlot[] } = {}
 ): Promise<void> {
   if (conversation.isTest) {
     await persistTestOutbound(conversation, text);
+    // El sandbox nunca sale a Meta: sus horarios son seleccionables al instante.
+    if (ctx.offers && ctx.offers.length > 0) {
+      await replaceOffers(conversation.organizationId, conversation.id, ctx.offers);
+    }
     return;
   }
   try {
@@ -548,6 +956,8 @@ async function deliverReply(
       organizationId: conversation.organizationId,
       text,
       aiGenerated: true,
+      dedupeKey: ctx.turnKey,
+      offers: ctx.offers,
     });
   } catch (err) {
     if (err instanceof SendError && err.code === "window_closed") {
@@ -657,9 +1067,21 @@ export async function applyHandoff(
   // traspaso sobre la MISMA conversación (p. ej. la despedida del handoff de
   // arriba falla por ventana cerrada y `deliverReply` dispara su propio
   // applyHandoff("ventana")) no debe pisar el motivo real ya registrado.
+  //
+  // 026 (regla 11 d/e) — CUALQUIER handoff, sea cual sea el motivo, limpia la
+  // memoria de aclaración de disponibilidad: "interviene una persona" cierra
+  // el ciclo pendiente, sin importar si la agenda tuvo algo que ver con este
+  // traspaso en particular.
   const updated = await db
     .update(schema.conversation)
-    .set({ handoffAt: new Date(), handoffReason: reason, updatedAt: new Date() })
+    .set({
+      handoffAt: new Date(),
+      handoffReason: reason,
+      updatedAt: new Date(),
+      agendaClarifyCount: 0,
+      agendaClarifyKind: null,
+      agendaClarifyContext: null,
+    })
     .where(
       and(
         eq(schema.conversation.id, conversationId),

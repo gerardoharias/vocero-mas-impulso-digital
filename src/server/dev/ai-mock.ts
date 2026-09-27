@@ -1,4 +1,6 @@
-import { JUDGE_MARKER } from "@/server/ai/prompts";
+import { AGENDA_PRIORITY_MARKER, JUDGE_MARKER } from "@/server/ai/prompts";
+import { extractTemporalQuery } from "@/server/agenda/query-intent";
+import { RECOVERY_MARKER } from "@/server/ai/recovery";
 
 /**
  * Proveedor LLM determinista para el self-test (contrato mocks.md).
@@ -29,7 +31,91 @@ function isTranscriptionRequest(content: unknown): boolean {
   );
 }
 
+/** Prefijo del mensaje de corrección por esquema que arma `lib/ai` (spec 023). */
+const CORRECTION_PREFIX = "Tu respuesta anterior es JSON pero no cumple el esquema";
+
+const globalForMock = globalThis as unknown as { __aiMockCalls?: number };
+
+/** 023: contador de llamadas recibidas (evidencia del self-test: "no hay 3 cargos"). */
+export function aiMockStats(): { calls: number } {
+  return { calls: globalForMock.__aiMockCalls ?? 0 };
+}
+export function resetAiMockStats(): void {
+  globalForMock.__aiMockCalls = 0;
+}
+
+const WEEKDAY_ALT = "lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo";
+/** 026 — un calificador de semana ("este"/"de la próxima semana"…) pegado a un día. */
+const WEEK_SUFFIX_ALT =
+  "de\\s+la\\s+(?:pr[oó]xima|otra)\\s+semana|de\\s+la\\s+semana\\s+(?:que\\s+viene|entrante|pr[oó]xima)";
+const QUALIFIED_DAY_RE = new RegExp(
+  `\\b(?:(este|esta)\\s+)?(${WEEKDAY_ALT})(?:\\s+(${WEEK_SUFFIX_ALT}))?`,
+  "i"
+);
+
+/** 026 — «jueves o viernes [de la próxima semana]»: el calificador (si lo hay) aplica a ambos. */
+function mockAlternativeDays(text: string): string[] | null {
+  const m = text.match(new RegExp(`\\b(${WEEKDAY_ALT})\\s+o\\s+(${WEEKDAY_ALT})\\b`, "i"));
+  if (!m) return null;
+  const suffixM = text.match(new RegExp(WEEK_SUFFIX_ALT, "i"));
+  const suffix = suffixM ? ` ${suffixM[0]}` : "";
+  return [`${m[1]}${suffix}`, `${m[2]}${suffix}`];
+}
+
+/**
+ * 025/026 — Extrae de la frase del cliente los parámetros de `check_availability`.
+ * Sólo reconoce un puñado de formas de prueba (`consulta:` no hace falta): el
+ * self-test las usa para ejercitar el camino real de punta a punta.
+ */
+function mockAvailabilityQuery(
+  text: string
+): {
+  day?: string;
+  days?: string[];
+  times?: string[];
+  from?: string;
+  to?: string;
+  edge?: "earliest" | "latest";
+} | null {
+  const alt = mockAlternativeDays(text);
+  if (alt) return { days: alt };
+
+  // 026 — el día TAL CUAL lo dijo el cliente, con su calificador si trae uno
+  // ("este jueves", "el jueves de la próxima semana"): el servidor es quien
+  // distingue una semana de otra (regla del prompt real).
+  const dayMatch = text.match(QUALIFIED_DAY_RE);
+  const day = dayMatch
+    ? dayMatch[1]
+      ? `${dayMatch[1]} ${dayMatch[2]}`
+      : dayMatch[3]
+        ? `${dayMatch[2]} ${dayMatch[3]}`
+        : dayMatch[2]
+    : text.match(/\b(hoy|ma[nñ]ana|pasado ma[nñ]ana)\b/)?.[1];
+  if (/\b(m[aá]s tarde|[uú]ltimo horario)\b/.test(text)) {
+    return { ...(day ? { day } : {}), edge: "latest" };
+  }
+  if (/\b(m[aá]s temprano|primer horario)\b/.test(text)) {
+    return { ...(day ? { day } : {}), edge: "earliest" };
+  }
+  // «a las 4 o 5 de la tarde», «a las 11 o 12»
+  const hours = text.match(/\ba las (\d{1,2})(?::(\d{2}))?(?: o (\d{1,2})(?::(\d{2}))?)?( de la (?:tarde|ma[nñ]ana|noche))?/);
+  if (hours && day) {
+    const suffix = hours[5] ?? "";
+    const times = [`${hours[1]}${hours[2] ? `:${hours[2]}` : ""}${suffix}`];
+    if (hours[3]) times.push(`${hours[3]}${hours[4] ? `:${hours[4]}` : ""}${suffix}`);
+    return { day, times };
+  }
+  // «más horarios mañana», «qué horarios hay el lunes», «este jueves», «el jueves de la próxima semana»
+  if (day && /\bhorarios?\b|\best[ae]\b|\bpr[oó]xima\s+semana\b/.test(text)) return { day };
+  // Expresión que el servidor NO soporta («la semana que viene»): el modelo la pasa
+  // tal cual y es el servidor quien pide la aclaración (spec 025 §5.2).
+  const week = text.match(/\b(la )?semana (que viene|pr[oó]xima|siguiente)\b/);
+  if (week) return { day: week[0] };
+  return null;
+}
+
 export function aiMockCompletion(messages: InMessage[]): string {
+  globalForMock.__aiMockCalls = (globalForMock.__aiMockCalls ?? 0) + 1;
   const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
   // 018: transcripción de audio — determinista, sin decodificar el audio real.
   if (lastUserMsg && isTranscriptionRequest(lastUserMsg.content)) {
@@ -73,6 +159,35 @@ export function aiMockCompletion(messages: InMessage[]): string {
       });
     }
     return JSON.stringify({ veredicto: "verde", hallazgos: [] });
+  }
+
+  // 023 — Recuperación de texto plano: el verificador devuelve el borrador
+  // tal cual (como lo haría un modelo obediente), para que el self-test pueda
+  // recorrer el camino completo.
+  if (system.includes(RECOVERY_MARKER)) {
+    const draft = lastUser.match(/<borrador>\n([\s\S]*)\n<\/borrador>/)?.[1];
+    return JSON.stringify(
+      draft ? { action: "reply", text: draft } : { action: "none" }
+    );
+  }
+
+  // 023 — Disparadores deterministas de salida defectuosa del modelo. La
+  // llamada correctiva por esquema llega con un mensaje de `user` que empieza
+  // por CORRECTION_PREFIX: el disparador se busca en el mensaje anterior.
+  const userTexts = messages
+    .filter((m) => m.role === "user")
+    .map((m) => flattenContent(m.content));
+  const isCorrection = lastUser.startsWith(CORRECTION_PREFIX);
+  const trigger = (isCorrection ? userTexts.at(-2) : lastUser) ?? "";
+  // Incidente 2026-09: pregunta fuera de alcance → respuesta correcta pero en
+  // TEXTO PLANO, sin JSON.
+  if (/^prueba:texto-plano\b/i.test(trigger)) {
+    return "Solo me enfoco en temas de CRM. Si quieres, seguimos con la demostración.";
+  }
+  // JSON válido pero con una acción que el esquema no admite: ni el intento
+  // principal ni la corrección lo arreglan → formato irrecuperable.
+  if (/^prueba:formato-invalido\b/i.test(trigger)) {
+    return JSON.stringify({ action: "book_slot" });
   }
 
   const text = lastUser.toLowerCase();
@@ -158,13 +273,12 @@ export function aiMockCompletion(messages: InMessage[]): string {
     ];
     // El SEGUNDO día ofrecido: determinista y distinto del primero que ya vio.
     const day = dias[1] ?? dias[0];
+    // 025/026: pedir un día concreto ya NO es otra ronda de `offer_slots` —
+    // es una CONSULTA de disponibilidad, que el motor resuelve con la agenda
+    // completa en vez de repetir la muestra que el cliente acaba de ver.
     return JSON.stringify(
       day
-        ? {
-            action: "offer_slots",
-            day,
-            reply: "Claro, te paso lo que tengo ese día:",
-          }
+        ? { action: "check_availability", day }
         : { action: "reply", text: "NO-RECIBI-DIAS-EN-EL-CONTEXTO" }
     );
   }
@@ -174,11 +288,7 @@ export function aiMockCompletion(messages: InMessage[]): string {
   // cuando ese día no tiene nada.
   const diaExacto = lastUser.match(/^dia-exacto:\s*(\d{4}-\d{2}-\d{2})/i);
   if (diaExacto) {
-    return JSON.stringify({
-      action: "offer_slots",
-      day: diaExacto[1],
-      reply: "¡Claro! Aquí tienes los horarios de ese día:",
-    });
+    return JSON.stringify({ action: "check_availability", day: diaExacto[1] });
   }
 
   // Auditoría 2026-09-17 — pedir MOVER una cita existente nunca debe caer en
@@ -215,6 +325,22 @@ export function aiMockCompletion(messages: InMessage[]): string {
       startUtc: offeredStarts[0],
       reply: "¡Perfecto! Te confirmo tu cita.",
     });
+  }
+  // 025 (rev. correctiva) — Un perfil HEREDADO que dice «usa offer_slots» arrastra al
+  // modelo a ofrecer horarios aunque el cliente haya pedido un día/hora/rango. El
+  // mock lo simula (sólo si esa regla está en las instrucciones DEL NEGOCIO, no en
+  // las reglas del sistema) para ejercitar de punta a punta la compuerta del servidor.
+  const businessInstructions =
+    system.split("Instrucciones del negocio:")[1]?.split(AGENDA_PRIORITY_MARKER)[0] ?? "";
+  if (/usa\s+offer_slots/i.test(businessInstructions) && extractTemporalQuery(lastUser).hasTemporal) {
+    return JSON.stringify({ action: "offer_slots", reply: "Claro, aquí tienes algunos horarios:" });
+  }
+  // 025 — Consulta DIRECTA de disponibilidad (día / hora / rango / extremo):
+  // dispara `check_availability` con las palabras del cliente, igual que lo haría
+  // el modelo real. Va antes del offer_slots genérico (que también matchea "horario").
+  const availabilityQuery = mockAvailabilityQuery(text);
+  if (availabilityQuery) {
+    return JSON.stringify({ action: "check_availability", ...availabilityQuery });
   }
   if (/agendar|\bcita\b|horario/.test(text)) {
     return JSON.stringify({

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { apiError, parseBody, withAuth } from "@/lib/api";
 import { testAiCredentials } from "@/lib/ai";
+import { effectiveAiModels } from "@/lib/ai/config";
 import {
   deleteAiCredentials,
   getAiCredentials,
@@ -17,8 +18,14 @@ export const dynamic = "force-dynamic";
 
 export const GET = withAuth(async (session) => {
   const creds = await getAiCredentials(session.organizationId);
-  if (!creds) return Response.json({ connection: null });
+  // 023: los modelos EFECTIVOS (de dónde sale cada uno), para verificar en
+  // producción qué identificador se usa exactamente — sin ningún token.
+  const effective = effectiveAiModels(
+    creds ? { model: creds.model, judgeModel: creds.judgeModel } : null
+  );
+  if (!creds) return Response.json({ connection: null, effective });
   return Response.json({
+    effective,
     connection: {
       status: creds.status,
       tokenLast4: tokenLast4(creds.token),

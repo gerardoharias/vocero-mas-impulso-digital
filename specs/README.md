@@ -14,6 +14,10 @@ producto** — y saberlo antes de leerla ahorra una confusión.
 | `015-motor-agenda-universal` | Ciclo completo | spec, plan, research, data-model, 2 contratos, quickstart, checklist, tasks + la enmienda constitucional que habilitó los conectores |
 | `016-atribucion-capi` | Ciclo completo | spec, plan, research, data-model, 2 contratos, quickstart, checklist, tasks |
 | `017-canal-messenger` | Ciclo completo | spec (sobre los cimientos de 014: mismo adaptador-por-canal y bandera) |
+| `023-respuesta-estructurada-agente` | Ciclo completo | spec, plan, data-model, tasks (incidente: texto plano descartado → 3 llamadas + handoff `error`; rev. 2 añadió la migración 0022) |
+| `024-entrega-integra-mensajes-salientes` | Ciclo completo | spec, plan, data-model, tasks (incidente: `offer_slots` rechazado por Meta → llegó sólo la introducción; migración 0023 + outbox sobre `message`; complementa —no modifica— a 023; §5.6-5.7 añaden la revalidación y el guard de ofertas, incluida la re-oferta de `bookSlot` de la 015) |
+| `025-consultas-disponibilidad-calendario` | Ciclo completo | spec, plan, data-model (sin migración), tasks (defecto: el agente infería «no hay» de una lista truncada — 12 de 97 horarios libres —; acción `check_availability`, metadatos `exhaustive`/`hasMore`, alternativas cercanas, API del cerebro externo; se apoya en 024 §5.6-5.7 y `registerAlternatives` sin modificarlos) |
+| `026-aclaraciones-disponibilidad-calendario` | Ciclo completo | spec, plan, data-model (migración nueva en `conversation`), tasks — **nada implementado todavía**: calificador de semana pegado a un día (3 rutas: sin calificador/"próximo", "este", "de la próxima semana" — regla semántica confirmada por el dueño), días alternativos (`days[]`, tope 3), memoria de aclaración por conversación (mismo patrón que `ai_fail_count` de 023), fechas candidatas concretas antes de escalar, límite de 3 aclaraciones consecutivas |
 
 Los tres carriles —ciclo completo, ligero y exento— están definidos en el
 [Principio VI de la constitución](../.specify/memory/constitution.md). El

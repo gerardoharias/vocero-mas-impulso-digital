@@ -30,6 +30,14 @@ vi.mock("@/server/whatsapp/credentials", () => ({
 
 vi.mock("@/server/events/bus", () => ({ publish: vi.fn() }));
 
+// 024: el envío de texto pasa por el outbox (persistir ANTES de intentar). La
+// política y los intentos se prueban en tests/unit/outbox-policy.test.ts y en
+// tests/integration/outbound-*.test.ts (Postgres real); aquí sólo el contrato
+// de `sendText` hacia sus llamadores.
+const enqueueText = vi.fn();
+const attemptDelivery = vi.fn();
+vi.mock("@/server/outbox", () => ({ enqueueText, attemptDelivery }));
+
 function makeChain(rows: unknown[]) {
   const chain: Record<string, unknown> = {};
   for (const m of ["from", "innerJoin", "where", "orderBy"]) {
@@ -83,6 +91,8 @@ function conversationRow(overrides: Record<string, unknown> = {}) {
 describe("sendText — un rechazo real de Meta queda visible", () => {
   beforeEach(() => {
     graphRequest.mockReset();
+    enqueueText.mockReset();
+    attemptDelivery.mockReset();
     getCredentialsByOrg.mockReset();
     selectRows.length = 0;
     inserted.length = 0;
@@ -93,13 +103,25 @@ describe("sendText — un rechazo real de Meta queda visible", () => {
     });
   });
 
-  it("Meta rechaza síncronamente (131026) → persiste 'failed' con el motivo traducido", async () => {
-    const { MetaApiError } = await import("@/lib/meta/client");
-    graphRequest.mockRejectedValue(
-      new MetaApiError("Message Undeliverable", { status: 400, code: 131026 })
-    );
-    selectRows.push([conversationRow()]);
+  it("persiste el payload ANTES del primer intento y un rechazo definitivo (131026) lanza SendError con messageId", async () => {
     const { sendText, SendError } = await import("@/server/inbox/send");
+    const order: string[] = [];
+    enqueueText.mockImplementation(async () => {
+      order.push("enqueue");
+      return { message: { id: "msg_9", status: "queued" }, created: true };
+    });
+    attemptDelivery.mockImplementation(async () => {
+      order.push("attempt");
+      return {
+        claimed: true,
+        messageId: "msg_9",
+        attemptNo: 1,
+        outcome: "failed",
+        class: "recipient_unavailable",
+        sendError: new SendError("meta_error", "El destinatario no puede recibir (Meta 131026)"),
+      };
+    });
+    selectRows.push([conversationRow()]);
 
     await expect(
       sendText({
@@ -107,27 +129,58 @@ describe("sendText — un rechazo real de Meta queda visible", () => {
         organizationId: "org_1",
         text: "hola",
         aiGenerated: true,
+        dedupeKey: "agent-turn:msg_in",
       })
     ).rejects.toMatchObject({
       code: "meta_error",
+      messageId: "msg_9",
       message: expect.stringMatching(/no puede recibir/i),
     });
 
-    const failedInsert = inserted.find((i) => i.values.status === "failed");
-    expect(failedInsert).toBeDefined();
-    expect(failedInsert!.values.error).toMatch(/no puede recibir/i);
-    expect(failedInsert!.values.text).toBe("hola");
-    expect(failedInsert!.values.direction).toBe("out");
+    expect(order).toEqual(["enqueue", "attempt"]);
+    expect(enqueueText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "hola",
+        origin: "ai",
+        aiGenerated: true,
+        dedupeKey: "agent-turn:msg_in",
+      })
+    );
+    // El intento lee el payload de la base: sólo recibe el id (y el destino).
+    expect(attemptDelivery).toHaveBeenCalledWith("msg_9", expect.anything());
+    expect(graphRequest).not.toHaveBeenCalled(); // el transporte es del outbox
+  });
 
-    // sanity: instancia tipada, no un Error genérico.
-    let caught: unknown;
+  it("un fallo RECUPERABLE no lanza: el mensaje ya existe y el outbox lo reintenta", async () => {
+    const { sendText } = await import("@/server/inbox/send");
+    enqueueText.mockResolvedValue({ message: { id: "msg_7", status: "queued" }, created: true });
+    attemptDelivery.mockResolvedValue({
+      claimed: true,
+      messageId: "msg_7",
+      attemptNo: 1,
+      outcome: "retrying",
+    });
     selectRows.push([conversationRow()]);
-    try {
-      await sendText({ conversationId: "cv_1", organizationId: "org_1", text: "hola" });
-    } catch (err) {
-      caught = err;
-    }
-    expect(caught).toBeInstanceOf(SendError);
+
+    await expect(
+      sendText({ conversationId: "cv_1", organizationId: "org_1", text: "hola", aiGenerated: true })
+    ).resolves.toEqual({ messageId: "msg_7", status: "retrying" });
+  });
+
+  it("la MISMA respuesta lógica (dedupeKey ya existente) no se vuelve a enviar", async () => {
+    const { sendText } = await import("@/server/inbox/send");
+    enqueueText.mockResolvedValue({ message: { id: "msg_5", status: "pending" }, created: false });
+    selectRows.push([conversationRow()]);
+
+    const res = await sendText({
+      conversationId: "cv_1",
+      organizationId: "org_1",
+      text: "hola",
+      aiGenerated: true,
+      dedupeKey: "agent-turn:msg_in",
+    });
+    expect(res).toEqual({ messageId: "msg_5", status: "pending" });
+    expect(attemptDelivery).not.toHaveBeenCalled();
   });
 
   it("contacto sin teléfono ni identidad utilizable → 'failed' visible, no un silencio total", async () => {

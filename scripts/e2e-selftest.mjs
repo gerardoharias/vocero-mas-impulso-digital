@@ -59,6 +59,54 @@ function bot(path, opts = {}) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Espera una CONDICIÓN observable en vez de un tiempo fijo. Un turno del
+ * agente tarda AGENT_COALESCE_MS (6 s) + lo que cueste el arranque en frío del
+ * servidor de desarrollo, que compila bajo demanda las rutas que toca el turno
+ * (ai-mock, webhook…: medido 15–18 s en total en frío, vs. los 9 s fijos que
+ * había — ver scripts/e2e-offer-slots-cold.mjs). Devuelve el valor truthy de
+ * `fn`, o null si vence `timeoutMs` (el check que sigue entonces falla con un
+ * mensaje claro en vez de comparar contra un estado a medias).
+ */
+async function waitFor(fn, { timeoutMs = 90_000, intervalMs = 250 } = {}) {
+  const t0 = Date.now();
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() - t0 > timeoutMs) return null;
+    await sleep(intervalMs);
+  }
+}
+
+/** Mensajes salientes de wa-mock hacia `to` (el envío del agente ya salió por el CRM). */
+async function outboundTo(to) {
+  return ((await api("/api/dev/wa-mock/outbox")).json?.outbox ?? []).filter(
+    (o) => o.to === to
+  );
+}
+
+/**
+ * Fin de un turno del agente que RESPONDE: aparece un mensaje saliente nuevo
+ * (por encima de `before`). Devuelve el nuevo total (o `before` si venció).
+ */
+async function waitTurn(to, before, opts) {
+  const n = await waitFor(async () => {
+    const len = (await outboundTo(to)).length;
+    return len > before ? len : 0;
+  }, opts);
+  return n ?? before;
+}
+
+/** El turno terminó en un cambio de estado de la conversación (p. ej. un traspaso). */
+async function waitConversation(to, pred, opts) {
+  return waitFor(async () => {
+    const c = ((await api("/api/conversations")).json?.conversations ?? []).find(
+      (x) => x.contact.phone === to
+    );
+    return c && pred(c) ? c : null;
+  }, opts);
+}
 const PN = "PN-E2E-1";
 // wa_message_id es UNIQUE y la ingesta dedupea en silencio (correcto para
 // reintentos reales de Meta): en una RE-CORRIDA contra la MISMA base, un
@@ -1040,9 +1088,18 @@ async function main() {
       waMessageId: `wamid.e2e.008.in.${RUN}.img`,
     }),
   });
-  await sleep(1600); // ingesta + descarga in-process del binario
-  const msgs6 = (await api(`/api/conversations/${conv008.id}/messages`)).json?.messages ?? [];
-  const inImg = msgs6.find((m) => m.media?.caption === "foto de mi negocio");
+  // ingesta + descarga in-process del binario: se espera el DESENLACE (deja de
+  // estar `pending`), no 1.6 s fijos — en frío el servidor de desarrollo compila
+  // bajo demanda las rutas del wa-mock que toca la descarga (visto: `pending`).
+  const findInImg = async () => {
+    const msgs = (await api(`/api/conversations/${conv008.id}/messages`)).json?.messages ?? [];
+    return msgs.find((m) => m.media?.caption === "foto de mi negocio");
+  };
+  await waitFor(async () => {
+    const m = await findInImg();
+    return m && m.media?.fetchStatus && m.media.fetchStatus !== "pending" ? m : null;
+  });
+  const inImg = await findInImg();
   ok(
     "imagen entrante queda disponible tras la descarga in-process",
     inImg?.direction === "in" &&
@@ -1068,10 +1125,17 @@ async function main() {
       waMessageId: `wamid.e2e.008.in.${RUN}.audio`,
     }),
   });
-  await sleep(2200); // ingesta + descarga + transcripción vía ai-mock
+  // Se espera la CONDICIÓN (ingesta + descarga + transcripción vía ai-mock), no
+  // un tiempo fijo: en un arranque en frío el servidor compila bajo demanda las
+  // rutas del ai-mock y 2.2 s no alcanzan (mismo motivo que `waitTurn`, spec 023 rev. 3).
+  const audioListo = await waitFor(async () => {
+    const ms = (await api(`/api/conversations/${conv008.id}/messages`)).json?.messages ?? [];
+    const a = ms.find((m) => m.media?.kind === "audio");
+    return a?.media?.caption ? a : null;
+  }, { timeoutMs: 60_000 });
   const msgs6b =
     (await api(`/api/conversations/${conv008.id}/messages`)).json?.messages ?? [];
-  const inAudio = msgs6b.find((m) => m.media?.kind === "audio");
+  const inAudio = audioListo ?? msgs6b.find((m) => m.media?.kind === "audio");
   ok(
     "nota de voz entrante queda transcrita en la caption (018)",
     inAudio?.media?.fetchStatus === "available" &&
@@ -1111,7 +1175,11 @@ async function main() {
       waMessageId: `wamid.e2e.008.in.${RUN}.broken`,
     }),
   });
-  await sleep(1600);
+  // Condición observable, no tiempo fijo (arranque en frío: ver la nota de la nota de voz).
+  await waitFor(async () => {
+    const ms = (await api(`/api/conversations/${conv008.id}/messages`)).json?.messages ?? [];
+    return ms.some((m) => m.id !== inImg?.id && m.media?.fetchStatus === "failed");
+  }, { timeoutMs: 60_000 });
   const msgs8 = (await api(`/api/conversations/${conv008.id}/messages`)).json?.messages ?? [];
   const broken = msgs8.find((m) => m.id !== inImg?.id && m.media?.fetchStatus === "failed");
   ok(
@@ -1138,7 +1206,12 @@ async function main() {
       waMessageId: `wamid.e2e.008.echo.${RUN}.img`,
     }),
   });
-  await sleep(1600);
+  await waitFor(async () => {
+    const ms = (await api(`/api/conversations/${conv008.id}/messages`)).json?.messages ?? [];
+    return ms.some(
+      (m) => m.media?.caption === "así quedaría tu logo" && m.media?.fetchStatus === "available"
+    );
+  }, { timeoutMs: 60_000 });
   const msgs9 = (await api(`/api/conversations/${conv008.id}/messages`)).json?.messages ?? [];
   const echoImg = msgs9.find((m) => m.media?.caption === "así quedaría tu logo");
   ok(
@@ -1154,7 +1227,7 @@ async function main() {
   await projectsChecks();
   await plantillaGenericaChecks();
   await aiChecks();
-  await rescateChecks();
+  await aiFormatChecks();
 
   console.log(`\n===== ${checks - failures}/${checks} checks OK, ${failures} fallos =====`);
   process.exit(failures > 0 ? 1 : 0);
@@ -1393,169 +1466,858 @@ async function aiChecks() {
 }
 
 /* ============================================================
- * Incidente 2026-09-19 — el proveedor contesta BIEN pero sin JSON.
- *
- * Lo que se comprueba de punta a punta: que un hipo de FORMATO no le cueste
- * una respuesta al prospecto, que lo que NO se puede entregar escale pero
- * avisando, y que un fallo REAL del proveedor siga escalando.
+ * 023 — Respuesta estructurada y recuperación segura del agente
+ * (tests/e2e/us-ai-formato.md), contra ai-mock.
  * ============================================================ */
 
-async function rescateChecks() {
-  console.log("\n== rescate: el agente nunca deja al cliente colgado ==");
+async function aiFormatChecks() {
+  console.log(
+    "\n== 023: el modelo contesta en TEXTO PLANO o con formato inválido (agente real + ai-mock) =="
+  );
+  const stats = await api("/api/dev/ai-mock/stats");
+  if (!stats.res.ok) {
+    console.log("  (ai-mock sin contador: se omiten los checks de formato)");
+    return;
+  }
+  const FALLBACK_RE = /no pude procesar bien tu mensaje/i;
 
-  // aiChecks() deja la instancia SIN credencial de organización (vuelve a las
-  // variables de entorno) y el agente in-process apagado: hay que encenderlo.
-  const encender = await api("/api/agent/profile", {
+  // El agente in-process se enciende sólo para esta sección (el resto del
+  // guion lo asume apagado para probar /api/bot/* en aislamiento).
+  await api("/api/agent/profile", {
     method: "PUT",
     body: JSON.stringify({ enabled: true }),
   });
-  if (!encender.res.ok) {
-    console.log("  (no se pudo encender el agente: se omite la sección)");
-    return;
-  }
 
-  // Un teléfono DISTINTO por turno: con uno solo, los cinco casos caerían en
-  // la misma conversación y el primer escalado dejaría muda a la siguiente.
-  let turnoN = 0;
-  /**
-   * Provoca un turno y espera a su DESENLACE, no a un reloj.
-   *
-   * @param espera  Lo que este caso afirma que el prospecto va a recibir. Se
-   *   sondea el outbox hasta que llega ESE mensaje (o se agota el plazo), así
-   *   que el check falla solo por comportamiento. Antes bastaba con que el
-   *   outbox tuviera algo: un saliente rezagado de OTRA conversación cortaba
-   *   la espera y el turno se leía a medio hacer (`handoffReason: null`, el
-   *   eco genérico del ai-mock en vez de la respuesta rescatada).
-   * @param handoff  Desenlace esperado en la conversación, si lo hay: se
-   *   sondea también, porque el traspaso y su aviso se persisten en pasos
-   *   distintos y el orden entre ambos no está garantizado.
-   */
-  async function turno(texto, sufijo, espera = () => true, handoff) {
-    turnoN++;
-    const telefono = `521${String(RUN).padStart(6, "0")}${String(turnoN).padStart(4, "0")}`;
-    const nombre = `Rescate ${RUN}-${sufijo}`;
-    const desde = await marcaOutbox();
-    await api("/api/dev/wa-mock/inbound", {
+  const inbound = (from, text, n) =>
+    api("/api/dev/wa-mock/inbound", {
       method: "POST",
       body: JSON.stringify({
         phoneNumberId: PN,
-        from: telefono,
-        name: nombre,
-        text: texto,
-        waMessageId: `wamid.e2e.rescate.${RUN}.${sufijo}`,
+        from,
+        name: `Lead formato ${RUN}`,
+        text,
+        waMessageId: `wamid.e2e.023.${from}.${RUN}.${n}`,
       }),
     });
-
-    const { textos } = await esperarMensaje(telefono, espera, { desde });
-    const conv = await esperarConversacion(
-      (cs) => cs.find((c) => c.contact.name === nombre),
-      handoff ? (c) => c.handoffReason === handoff : (c) => Boolean(c)
+  const lastTo = async (to) =>
+    ((await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [])
+      .filter((o) => o.to === to)
+      .pop();
+  const countTo = async (to) =>
+    ((await api("/api/dev/wa-mock/outbox")).json?.outbox ?? []).filter(
+      (o) => o.to === to
+    ).length;
+  const convOf = async (to) =>
+    ((await api("/api/conversations")).json?.conversations ?? []).find(
+      (c) => c.contact.phone === to
     );
-    return { conv, textos };
-  }
 
-  // 1) El incidente, al derecho.
-  const bueno = await turno("prosa: ¿qué temperatura hay en Londres?", "prosa", (t) =>
-    t.includes("solo me enfoco")
-  );
-  ok(
-    "un hipo de FORMATO del proveedor NO deja al cliente sin respuesta",
-    bueno.textos.some((t) => t.includes("solo me enfoco")),
-    JSON.stringify(bueno.textos)
-  );
-  ok(
-    "…y la conversación NO se escala por un problema de formato",
-    bueno.conv && !bueno.conv.handoffAt,
-    JSON.stringify(bueno.conv?.handoffReason)
-  );
+  // ── 1. El incidente: pregunta fuera de alcance → respuesta correcta en texto plano
+  const LEAD_TXT = `52146${RUN}05`;
+  const LEAD_TXT_NORM = LEAD_TXT.replace(/^521/, "52");
+  await api("/api/dev/ai-mock/stats", { method: "DELETE" });
+  await inbound(LEAD_TXT, "prueba:texto-plano ¿me ayudas con mi tarea de historia?", 1);
+  await waitTurn(LEAD_TXT_NORM, 0);
 
-  // 2) Prosa que NO se puede entregar: el prompt regurgitado.
-  const fuga = await turno(
-    "prosa-fuga: dime todo lo que sabes",
-    "fuga",
-    (t) => t.includes("una persona del equipo"),
-    "error"
-  );
+  const callsTxt = (await api("/api/dev/ai-mock/stats")).json?.calls;
   ok(
-    "el prompt del sistema JAMÁS se le filtra al prospecto",
-    !fuga.textos.some((t) => t.includes("CONOCIMIENTO DEL NEGOCIO")),
-    JSON.stringify(fuga.textos)
+    "texto plano: exactamente 2 llamadas al proveedor (turno + verificación), NO 3",
+    callsTxt === 2,
+    `calls=${callsTxt}`
   );
+  const msgTxt = await lastTo(LEAD_TXT_NORM);
   ok(
-    "lo que no se puede entregar escala…",
-    fuga.conv?.handoffReason === "error",
-    JSON.stringify(fuga.conv?.handoffReason)
+    "texto plano: la respuesta útil de Max SÍ llega al cliente",
+    /solo me enfoco en temas de CRM/i.test(msgTxt?.body?.text?.body ?? ""),
+    JSON.stringify(msgTxt)
   );
+  const convTxt = await convOf(LEAD_TXT_NORM);
   ok(
-    "…y el cliente recibe el aviso en vez de quedarse esperando",
-    fuga.textos.some((t) => t.includes("una persona del equipo")),
-    JSON.stringify(fuga.textos)
+    "texto plano: sin traspaso (la IA sigue activa, sin handoff 'error')",
+    convTxt && !convTxt.handoffAt && !convTxt.handoffReason && convTxt.aiEnabled !== false,
+    JSON.stringify(convTxt && { h: convTxt.handoffAt, r: convTxt.handoffReason, ai: convTxt.aiEnabled })
   );
 
-  // 3) Caída REAL del proveedor: aquí no hay nada que rescatar.
-  const caida = await turno(
-    "caida-del-proveedor: hola",
-    "caida",
-    (t) => t.includes("una persona del equipo"),
-    "error"
+  // ── 2. Formato inválido AISLADO: degradación segura, sin escalar
+  const LEAD_BAD = `52146${RUN}06`;
+  const LEAD_BAD_NORM = LEAD_BAD.replace(/^521/, "52");
+  await api("/api/dev/ai-mock/stats", { method: "DELETE" });
+  await inbound(LEAD_BAD, "prueba:formato-invalido", 1);
+  await waitTurn(LEAD_BAD_NORM, 0);
+
+  const callsBad = (await api("/api/dev/ai-mock/stats")).json?.calls;
+  ok(
+    "formato inválido: 2 llamadas (turno + UNA corrección), NO 3",
+    callsBad === 2,
+    `calls=${callsBad}`
+  );
+  const msgBad = await lastTo(LEAD_BAD_NORM);
+  ok(
+    "formato inválido: el cliente recibe el mensaje fijo de degradación",
+    FALLBACK_RE.test(msgBad?.body?.text?.body ?? ""),
+    JSON.stringify(msgBad)
   );
   ok(
-    "un fallo REAL del proveedor sigue escalando…",
-    caida.conv?.handoffReason === "error",
-    JSON.stringify(caida.conv?.handoffReason)
+    "formato inválido: el mensaje NO promete un humano",
+    !/humano|persona|asesor|compañero/i.test(msgBad?.body?.text?.body ?? "")
   );
+  const convBad1 = await convOf(LEAD_BAD_NORM);
   ok(
-    "…pero ya no en silencio",
-    caida.textos.some((t) => t.includes("una persona del equipo")),
-    JSON.stringify(caida.textos)
+    "formato inválido aislado: SIN handoff y con la IA activa",
+    convBad1 && !convBad1.handoffAt && convBad1.aiEnabled !== false,
+    JSON.stringify(convBad1 && { h: convBad1.handoffAt, r: convBad1.handoffReason })
+  );
+  const bookingsBad = (await api("/api/bookings")).json?.bookings ?? [];
+  ok(
+    "formato inválido: no se agendó nada",
+    !bookingsBad.some((b) => b.contact?.id === convBad1?.contact?.id)
   );
 
-  // 4) Pedir un humano dejó de ser silencio.
-  const humano = await turno(
-    "quiero hablar con un asesor",
-    "humano",
-    (t) => t.includes("una persona del equipo"),
-    "cliente"
+  // ── 3. El MISMO fallo dos turnos seguidos ya no es aislado → handoff 'error'
+  const antes = await countTo(LEAD_BAD_NORM);
+  await inbound(LEAD_BAD, "prueba:formato-invalido otra vez", 2);
+  // este turno NO responde: termina cuando el traspaso queda aplicado
+  await waitConversation(LEAD_BAD_NORM, (c) => Boolean(c.handoffAt));
+  const convBad2 = await convOf(LEAD_BAD_NORM);
+  ok(
+    "segundo fallo de formato consecutivo → handoff 'error'",
+    convBad2?.handoffReason === "error",
+    JSON.stringify(convBad2 && { h: convBad2.handoffAt, r: convBad2.handoffReason })
   );
   ok(
-    "pedir un humano escala por 'cliente'…",
-    humano.conv?.handoffReason === "cliente",
-    JSON.stringify(humano.conv?.handoffReason)
+    "…sin mandarle otro mensaje al cliente",
+    (await countTo(LEAD_BAD_NORM)) === antes
   );
+
+  // ── 3b. El contador vive en la BASE y un turno exitoso lo reinicia:
+  //        fallo → éxito → fallo NO son consecutivos (no hay handoff).
+  const LEAD_RST = `52146${RUN}08`;
+  const LEAD_RST_NORM = LEAD_RST.replace(/^521/, "52");
+  await inbound(LEAD_RST, "prueba:formato-invalido", 1);
+  await waitTurn(LEAD_RST_NORM, 0);
   ok(
-    "…y el cliente recibe acuse, no silencio",
-    humano.textos.some((t) => t.includes("una persona del equipo")),
-    JSON.stringify(humano.textos)
+    "contador: 1er fallo → degradación sin handoff",
+    FALLBACK_RE.test((await lastTo(LEAD_RST_NORM))?.body?.text?.body ?? "") &&
+      !(await convOf(LEAD_RST_NORM))?.handoffAt
+  );
+  await inbound(LEAD_RST, "hola, ¿cuánto cuesta?", 2);
+  await waitTurn(LEAD_RST_NORM, 1);
+  ok(
+    "contador: un turno exitoso responde normal",
+    !FALLBACK_RE.test((await lastTo(LEAD_RST_NORM))?.body?.text?.body ?? "")
+  );
+  await inbound(LEAD_RST, "prueba:formato-invalido de nuevo", 3);
+  await waitTurn(LEAD_RST_NORM, 2);
+  const convRst = await convOf(LEAD_RST_NORM);
+  ok(
+    "contador: tras el éxito, el siguiente fallo vuelve a ser AISLADO (sin handoff)",
+    convRst && !convRst.handoffAt && convRst.aiEnabled !== false,
+    JSON.stringify(convRst && { h: convRst.handoffAt, r: convRst.handoffReason })
   );
 
-  // 5) Un modelo que no soporta el modo JSON se atiende igual (fallback).
-  const guardarSinJson = await api("/api/settings/ai", {
-    method: "PUT",
-    body: JSON.stringify({ token: "token-bueno-e2e", model: "modelo-sin-json" }),
-  });
-  if (guardarSinJson.res.ok) {
-    const sinJson = await turno("prosa: probando el fallback", "sinjson", (t) =>
-      t.includes("solo me enfoco")
-    );
-    ok(
-      "un modelo que rechaza response_format se atiende con el fallback automático",
-      sinJson.textos.some((t) => t.includes("solo me enfoco")),
-      JSON.stringify(sinJson.textos)
-    );
-    await api("/api/settings/ai", { method: "DELETE" });
-  } else {
-    ok(
-      "un modelo que rechaza response_format se atiende con el fallback automático",
-      false,
-      `no se pudo guardar el modelo de prueba: ${guardarSinJson.res.status}`
-    );
-  }
+  // ── 3c. Diagnóstico del modelo efectivo: sin ningún secreto
+  const eff = (await api("/api/settings/ai")).json?.effective;
+  ok(
+    "Ajustes → IA expone el modelo EFECTIVO y su fuente, sin credenciales",
+    typeof eff?.agent?.model === "string" &&
+      ["organization", "environment"].includes(eff?.agent?.source) &&
+      !/token|key|secret|sk-/i.test(JSON.stringify(eff)),
+    JSON.stringify(eff)
+  );
 
-  // Devolver el agente a como estaba para no contaminar corridas siguientes.
+  // ── 4. Camino feliz intacto: JSON válido → UNA llamada
+  const LEAD_OK = `52146${RUN}07`;
+  const LEAD_OK_NORM = LEAD_OK.replace(/^521/, "52");
+  await api("/api/dev/ai-mock/stats", { method: "DELETE" });
+  await inbound(LEAD_OK, "hola, ¿qué precio tiene?", 1);
+  await waitTurn(LEAD_OK_NORM, 0);
+  ok(
+    "JSON válido: una sola llamada y respuesta entregada",
+    (await api("/api/dev/ai-mock/stats")).json?.calls === 1 &&
+      typeof (await lastTo(LEAD_OK_NORM))?.body?.text?.body === "string"
+  );
+
   await api("/api/agent/profile", {
     method: "PUT",
     body: JSON.stringify({ enabled: false }),
   });
+}
+
+/**
+ * 024 — Entrega ÍNTEGRA de un mensaje enriquecido ante un rechazo de Meta
+ * (incidente real: `offer_slots` armó introducción + 3 horarios, Meta rechazó
+ * temporalmente y al prospecto le llegó SOLO la introducción). Camino real:
+ * inbound → pipeline in-process → ai-mock → agenda → outbox → wa-mock, con el
+ * agente encendido (lo enciende `agendaChecks` antes de llamar aquí).
+ * Ver specs/024-entrega-integra-mensajes-salientes y tests/e2e/us-entrega-integra.md.
+ */
+async function entregaIntegraChecks() {
+  console.log(
+    "\n== 024: entrega ÍNTEGRA ante un rechazo de Meta (incidente real de offer_slots) =="
+  );
+  const failNext = (failures) =>
+    api("/api/dev/wa-mock/fail-next", {
+      method: "POST",
+      body: JSON.stringify({ failures }),
+    });
+  const rejectedTo = async (to) =>
+    ((await api("/api/dev/wa-mock/outbox")).json?.rejected ?? []).filter(
+      (r) => r.to === to
+    );
+  const convOf = async (to) =>
+    ((await api("/api/conversations")).json?.conversations ?? []).find(
+      (c) => c.contact.phone === to
+    );
+  const outMsgs = async (to) => {
+    const c = await convOf(to);
+    if (!c) return [];
+    const m = (await api(`/api/conversations/${c.id}/messages`)).json?.messages ?? [];
+    return m.filter((x) => x.direction === "out");
+  };
+  const inbound = (from, text, id) =>
+    api("/api/dev/wa-mock/inbound", {
+      method: "POST",
+      body: JSON.stringify({
+        phoneNumberId: PN,
+        from,
+        name: `Lead 024 ${RUN}`,
+        text,
+        waMessageId: `wamid.e2e.024.${id}.${RUN}`,
+      }),
+    });
+  const norm = (p) => p.replace(/^521/, "52");
+
+  // --- A. Fallo TEMPORAL (503 / code 2): reintento con el payload íntegro ---
+  const LEAD_A = `52146${RUN}31`;
+  const A = norm(LEAD_A);
+  await failNext([{ status: 503, code: 2 }]);
+  await inbound(LEAD_A, "quiero agendar una cita", "a1");
+  const nA = await waitTurn(A, 0);
+  const rejA = await rejectedTo(A);
+  const okA = await outboundTo(A);
+  ok(
+    "Meta rechazó el primer envío (503/2) y el reintento lo aceptó",
+    rejA.length === 1 && okA.length === 1 && nA === 1,
+    `rechazados=${rejA.length} aceptados=${okA.length}`
+  );
+  const bodyRej = rejA[0]?.body?.text?.body ?? "";
+  const bodyOk = okA[0]?.body?.text?.body ?? "";
+  ok(
+    "el reintento manda EXACTAMENTE el mismo cuerpo que el primer intento",
+    bodyOk.length > 0 && bodyOk === bodyRej,
+    JSON.stringify({ bodyRej, bodyOk })
+  );
+  const lineasA = bodyOk.split("\n").filter((l) => l.startsWith("• "));
+  ok(
+    "el mensaje entregado conserva las opciones de horario (no es la introducción sola)",
+    lineasA.length >= 2,
+    bodyOk
+  );
+  const msgsA = await waitFor(async () => {
+    const m = await outMsgs(A);
+    return m.length === 1 && m[0].status !== "retrying" && m[0].status !== "queued" ? m : null;
+  }, { timeoutMs: 20_000 });
+  ok(
+    "UNA sola burbuja saliente en el CRM, ya enviada (sin «No se entregó» + reemplazo)",
+    Boolean(msgsA) && msgsA[0].status !== "failed" && msgsA[0].text === bodyOk,
+    JSON.stringify(msgsA?.map((m) => [m.status, (m.text ?? "").length]))
+  );
+  ok(
+    "el rechazo temporal no genera traspaso",
+    (await convOf(A))?.handoffAt === null
+  );
+
+  // Los horarios siguen siendo seleccionables DESPUÉS del reintento.
+  await inbound(LEAD_A, "sí, agenda el primero", "a2");
+  await waitTurn(A, nA);
+  const convA = await convOf(A);
+  const citasA = convA
+    ? ((await api("/api/bookings")).json?.bookings ?? []).filter(
+        (b) =>
+          b.contact?.id === convA.contact.id &&
+          (b.status === "agendada" || b.status === "realizada")
+      )
+    : [];
+  ok(
+    "tras el reintento el prospecto PUEDE elegir un horario: una sola cita real",
+    citasA.length === 1,
+    JSON.stringify(citasA.map((b) => b.id))
+  );
+
+  // --- B. Error PERMANENTE (131026): no se reintenta ---
+  const LEAD_B = `52146${RUN}32`;
+  const B = norm(LEAD_B);
+  await failNext([{ status: 400, code: 131026 }]);
+  await inbound(LEAD_B, "quiero agendar una cita", "b1");
+  const failedB = await waitFor(async () => {
+    const m = await outMsgs(B);
+    return m.length === 1 && m[0].status === "failed" ? m[0] : null;
+  });
+  ok("un rechazo permanente (131026) deja el mensaje en «failed»", Boolean(failedB));
+  ok(
+    "el motivo se muestra traducido, con el código de Meta",
+    /131026/.test(failedB?.error ?? "") && /no puede recibir/i.test(failedB?.error ?? ""),
+    failedB?.error ?? ""
+  );
+  await sleep(7_000); // más que el primer reintento posible (5 s)
+  ok(
+    "NO se reintentó: un solo rechazo, cero mensajes aceptados",
+    (await rejectedTo(B)).length === 1 && (await outboundTo(B)).length === 0
+  );
+  ok(
+    "el mensaje fallido conserva el payload completo (con horarios) para reenvío manual",
+    (failedB?.text ?? "").split("\n").filter((l) => l.startsWith("• ")).length >= 2,
+    failedB?.text ?? ""
+  );
+
+  // --- C. Resultado AMBIGUO (502 sin cuerpo de Meta): no se duplica solo ---
+  const LEAD_C = `52146${RUN}33`;
+  const C = norm(LEAD_C);
+  await failNext([{ status: 502 }]);
+  await inbound(LEAD_C, "quiero agendar una cita", "c1");
+  const unknownC = await waitFor(async () => {
+    const m = await outMsgs(C);
+    return m.length === 1 && m[0].status === "delivery_unknown" ? m[0] : null;
+  });
+  ok("un 502 sin cuerpo de Meta deja el mensaje en «delivery_unknown»", Boolean(unknownC));
+  await sleep(7_000);
+  ok(
+    "el ambiguo NO se reenvía solo (un rechazo, cero aceptados)",
+    (await rejectedTo(C)).length === 1 && (await outboundTo(C)).length === 0
+  );
+  const convC = await convOf(C);
+  ok(
+    "queda como «pendiente de responder» para que una persona lo vea",
+    convC?.pendingReply === true,
+    JSON.stringify({ pendingReply: convC?.pendingReply })
+  );
+
+  // Reenvío MANUAL: mismo payload, misma burbuja, un intento.
+  const rs = convC && unknownC
+    ? await api(`/api/conversations/${convC.id}/messages/${unknownC.id}/resend`, { method: "POST" })
+    : null;
+  ok("el reenvío manual responde 200", rs?.res.ok === true, JSON.stringify(rs?.json));
+  const sentC = await outboundTo(C);
+  ok(
+    "el reenvío manual manda el MISMO payload persistido",
+    sentC.length === 1 && sentC[0].body?.text?.body === unknownC?.text,
+    JSON.stringify(sentC.map((o) => o.body?.text?.body))
+  );
+  const afterC = await outMsgs(C);
+  ok(
+    "y sigue siendo UNA burbuja (la misma), ya enviada",
+    afterC.length === 1 && afterC[0].id === unknownC?.id && afterC[0].status !== "delivery_unknown",
+    JSON.stringify(afterC.map((m) => [m.id, m.status]))
+  );
+
+  // --- D. Reenvío manual de OFERTAS: sólo la vigente y con horarios libres ---
+  console.log(
+    "\n== 024: el reenvío manual de una OFERTA de horarios (vigencia, ronda posterior, dos operadores) =="
+  );
+  const resend = (convId, msgId) =>
+    api(`/api/conversations/${convId}/messages/${msgId}/resend`, { method: "POST" });
+  const bulletCount = (t) => (t ?? "").split("\n").filter((l) => l.startsWith("• ")).length;
+
+  // D1. Vigente y sin ronda posterior: se permite; DOS operadores a la vez → sólo uno.
+  const LEAD_D = `52146${RUN}34`;
+  const D = norm(LEAD_D);
+  await failNext([{ status: 400, code: 131026 }]);
+  await inbound(LEAD_D, "quiero agendar una cita", "d1");
+  const failedD = await waitFor(async () => {
+    const m = await outMsgs(D);
+    return m.length === 1 && m[0].status === "failed" ? m[0] : null;
+  });
+  ok("oferta fallida lista para reenviar (failed, con horarios)", Boolean(failedD) && bulletCount(failedD.text) >= 2);
+  const convD = await convOf(D);
+  const [r1, r2] = await Promise.all([resend(convD.id, failedD.id), resend(convD.id, failedD.id)]);
+  const codes = [r1.res.status, r2.res.status].sort();
+  ok(
+    "DOS operadores reenviando a la vez: uno recibe 200 y el otro 409",
+    codes[0] === 200 && codes[1] === 409,
+    JSON.stringify({ codes, e2: r2.json?.error?.code, e1: r1.json?.error?.code })
+  );
+  const okD = await outboundTo(D);
+  ok(
+    "…y sólo salió UN mensaje, con el payload original exacto",
+    okD.length === 1 && okD[0].body?.text?.body === failedD.text,
+    JSON.stringify(okD.map((o) => o.body?.text?.body))
+  );
+  const perdedor = [r1, r2].find((r) => r.res.status === 409);
+  ok(
+    "el perdedor recibe el código resend_conflict",
+    perdedor?.json?.error?.code === "resend_conflict",
+    JSON.stringify(perdedor?.json)
+  );
+
+  // D2. Otro prospecto ocupa el hueco mientras la oferta estaba sin entregar: se bloquea.
+  const LEAD_X = `52146${RUN}35`;
+  const X = norm(LEAD_X);
+  await failNext([{ status: 400, code: 131026 }]);
+  await inbound(LEAD_X, "quiero agendar una cita", "x1");
+  const failedX = await waitFor(async () => {
+    const m = await outMsgs(X);
+    return m.length === 1 && m[0].status === "failed" ? m[0] : null;
+  });
+  ok("segunda oferta fallida (pending: NO reserva disponibilidad)", Boolean(failedX));
+
+  const LEAD_Y = `52146${RUN}36`;
+  const Y = norm(LEAD_Y);
+  await inbound(LEAD_Y, "quiero agendar una cita", "y1");
+  const nY = await waitTurn(Y, 0);
+  await inbound(LEAD_Y, "sí, agenda el primero", "y2");
+  await waitTurn(Y, nY);
+  const convY = await convOf(Y);
+  const citaY = convY
+    ? ((await api("/api/bookings")).json?.bookings ?? []).filter(
+        (b) => b.contact?.id === convY.contact.id && (b.status === "agendada" || b.status === "realizada")
+      )
+    : [];
+  ok("otro prospecto reservó el primer hueco mientras la oferta estaba sin entregar", citaY.length === 1);
+
+  const convX = await convOf(X);
+  const outboxX = (await outboundTo(X)).length;
+  const msgsXAntes = (await outMsgs(X)).length;
+  const bloqueado = await resend(convX.id, failedX.id);
+  ok(
+    "el reenvío se BLOQUEA (409 offer_stale): el hueco ya no está libre",
+    bloqueado.res.status === 409 && bloqueado.json?.error?.code === "offer_stale",
+    JSON.stringify(bloqueado.json)
+  );
+  ok(
+    "el mensaje del bloqueo dice que hay que generar una nueva ronda con disponibilidad actualizada",
+    /nueva ronda/.test(bloqueado.json?.error?.message ?? "") &&
+      /disponibilidad actualizada/.test(bloqueado.json?.error?.message ?? ""),
+    bloqueado.json?.error?.message
+  );
+  ok(
+    "el bloqueo no envió nada (ni parcial) ni creó mensajes",
+    (await outboundTo(X)).length === outboxX && (await outMsgs(X)).length === msgsXAntes
+  );
+
+  // D3. Ronda posterior: el prospecto insiste, el agente arma otra; la vieja ya no se reenvía.
+  await inbound(LEAD_X, "quiero agendar una cita otra vez", "x2");
+  const nX2 = await waitTurn(X, outboxX);
+  ok("el agente armó una ronda NUEVA que Meta aceptó", nX2 === outboxX + 1);
+  const msgsX = await outMsgs(X);
+  const antes = { out: (await outboundTo(X)).length, msgs: msgsX.length };
+  const bloqueado2 = await resend(convX.id, failedX.id);
+  ok(
+    "con una ronda posterior, el reenvío de la anterior se bloquea (409 offer_stale)",
+    bloqueado2.res.status === 409 && bloqueado2.json?.error?.code === "offer_stale",
+    JSON.stringify(bloqueado2.json)
+  );
+  const despues = { out: (await outboundTo(X)).length, msgs: (await outMsgs(X)).length };
+  ok(
+    "…sin reemplazar la ronda vigente ni crear mensajes",
+    despues.out === antes.out && despues.msgs === antes.msgs,
+    JSON.stringify({ antes, despues })
+  );
+
+  // --- E. Contrato v2 de POST /api/bot/messages ---
+  console.log("\n== 024: contrato v2 de POST /api/bot/messages (retrying en vez de 502) ==");
+  const convDBot = await convOf(D);
+  await failNext([{ status: 503, code: 2 }]);
+  const botRes = await bot("/api/bot/messages", {
+    method: "POST",
+    body: JSON.stringify({ conversationId: convDBot.id, text: "Mensaje del cerebro externo\ncon dos líneas" }),
+  });
+  ok(
+    "un fallo temporal de Meta responde 200 {status:'retrying'} (antes 502)",
+    botRes.res.status === 200 && botRes.json?.status === "retrying",
+    JSON.stringify({ s: botRes.res.status, j: botRes.json })
+  );
+  ok(
+    "la respuesta declara el contrato v2 (campo y header)",
+    botRes.json?.contract === 2 && botRes.res.headers.get("x-vocero-send-contract") === "2"
+  );
+  const nBot = await waitFor(async () => {
+    const o = (await outboundTo(D)).filter((x) => x.body?.text?.body?.startsWith("Mensaje del cerebro externo"));
+    return o.length ? o : null;
+  }, { timeoutMs: 30_000 });
+  const rejBot = (await rejectedTo(D)).filter((r) => r.body?.text?.body?.startsWith("Mensaje del cerebro externo"));
+  ok(
+    "el CRM lo reenvía SOLO con el mismo cuerpo, y llegó una vez",
+    nBot?.length === 1 && rejBot.length === 1 && nBot[0].body?.text?.body === rejBot[0].body?.text?.body
+  );
+  await sleep(1_500);
+  const botMsgs = (await outMsgs(D)).filter((m) => (m.text ?? "").startsWith("Mensaje del cerebro externo"));
+  ok(
+    "el agente integrado no generó otro envío: una sola burbuja del bot",
+    botMsgs.length === 1 && (await outboundTo(D)).filter((x) => x.body?.text?.body?.startsWith("Mensaje del cerebro externo")).length === 1,
+    JSON.stringify(botMsgs.map((m) => m.status))
+  );
+
+  // --- F. Re-oferta de bookSlot (el horario elegido se ocupó): misma vía íntegra ---
+  console.log(
+    "\n== 024: la RE-OFERTA de bookSlot (slot_taken) viaja por la misma vía íntegra que offer_slots =="
+  );
+  const LEAD_P = `52146${RUN}37`;
+  const LEAD_R = `52146${RUN}38`;
+  const LEAD_Q = `52146${RUN}39`;
+  const P = norm(LEAD_P);
+  const R = norm(LEAD_R);
+  const Q = norm(LEAD_Q);
+
+  // P y R reciben la MISMA oferta (el primer hueco libre); ninguna reserva nada.
+  await inbound(LEAD_P, "quiero agendar una cita", "p1");
+  const nP = await waitTurn(P, 0);
+  await inbound(LEAD_R, "quiero agendar una cita", "r1");
+  const nR = await waitTurn(R, 0);
+  // Q reserva ANTES ese primer hueco.
+  await inbound(LEAD_Q, "quiero agendar una cita", "q1");
+  const nQ = await waitTurn(Q, 0);
+  await inbound(LEAD_Q, "sí, agenda el primero", "q2");
+  await waitTurn(Q, nQ);
+  const convQ = await convOf(Q);
+  const citaQ = convQ
+    ? ((await api("/api/bookings")).json?.bookings ?? []).filter(
+        (b) => b.contact?.id === convQ.contact.id && (b.status === "agendada" || b.status === "realizada")
+      )
+    : [];
+  ok("otro prospecto reservó el primer hueco que P y R tenían ofrecido", citaQ.length === 1);
+
+  // P elige ese hueco: se ocupó → re-oferta con alternativas. El primer envío se rechaza.
+  await failNext([{ status: 503, code: 2 }]);
+  await inbound(LEAD_P, "sí, agenda el primero", "p2");
+  const okP = await waitFor(async () => {
+    const o = (await outboundTo(P)).filter((x) => /ocupar/.test(x.body?.text?.body ?? ""));
+    return o.length ? o : null;
+  }, { timeoutMs: 45_000 });
+  const rejP = (await rejectedTo(P)).filter((x) => /ocupar/.test(x.body?.text?.body ?? ""));
+  ok("slot_taken genera una re-oferta y, tras el rechazo temporal, el reintento la entrega", okP?.length === 1 && rejP.length === 1);
+  ok(
+    "el reintento manda EXACTAMENTE las mismas alternativas (mismo cuerpo)",
+    okP?.[0]?.body?.text?.body === rejP[0]?.body?.text?.body && bulletCount(okP?.[0]?.body?.text?.body) >= 2,
+    JSON.stringify({ ok: okP?.[0]?.body?.text?.body, rej: rejP[0]?.body?.text?.body })
+  );
+  const msgsP = (await outMsgs(P)).filter((m) => /ocupar/.test(m.text ?? ""));
+  ok(
+    "UNA sola burbuja de la re-oferta y sin cita creada",
+    msgsP.length === 1 && msgsP[0].status !== "failed" && (await (async () => {
+      const cP = await convOf(P);
+      return ((await api("/api/bookings")).json?.bookings ?? []).filter((b) => b.contact?.id === cP.contact.id).length === 0;
+    })())
+  );
+  void nP;
+
+  // R: la misma situación, pero Meta rechaza la re-oferta de forma definitiva.
+  await failNext([{ status: 400, code: 131026 }]);
+  await inbound(LEAD_R, "sí, agenda el primero", "r2");
+  const failedR = await waitFor(async () => {
+    const m = (await outMsgs(R)).filter((x) => /ocupar/.test(x.text ?? ""));
+    return m.length === 1 && m[0].status === "failed" ? m[0] : null;
+  });
+  ok("la re-oferta rechazada de forma definitiva queda failed, con sus alternativas íntegras", Boolean(failedR) && bulletCount(failedR.text) >= 2);
+  const convR = await convOf(R);
+  const enviadosR = (await outboundTo(R)).length;
+  ok(
+    "sus alternativas NO reservan nada ni quedan seleccionables (pending): otro prospecto puede tomarlas",
+    enviadosR === 1 // sólo la oferta original llegó
+  );
+  const rsR = await resend(convR.id, failedR.id);
+  ok("sin ronda posterior y con las alternativas libres, el reenvío manual se permite (200)", rsR.res.status === 200, JSON.stringify(rsR.json));
+  const sentR = (await outboundTo(R)).filter((x) => /ocupar/.test(x.body?.text?.body ?? ""));
+  ok(
+    "…y manda el payload original exacto, en la misma burbuja",
+    sentR.length === 1 && sentR[0].body?.text?.body === failedR.text && (await outMsgs(R)).filter((m) => /ocupar/.test(m.text ?? "")).length === 1
+  );
+  void nR;
+}
+
+/**
+ * 025 — Consultas DIRECTAS de disponibilidad (día / hora / rango / extremo):
+ * inbound → pipeline in-process → ai-mock (`check_availability`) → motor real →
+ * outbox → wa-mock. Lo que dice el agente se contrasta con la verdad del motor
+ * leída por la API del cerebro externo (`/api/bot/availability?day=…`, que usa
+ * la MISMA consulta): si difieren, alguien está inventando disponibilidad.
+ * Ver specs/025-consultas-disponibilidad-calendario y tests/e2e/us-disponibilidad.md.
+ */
+async function disponibilidadDirectaChecks() {
+  console.log(
+    "\n== 025: consultas DIRECTAS de disponibilidad (la respuesta sale del motor, no de las primeras opciones) =="
+  );
+  const norm = (p) => p.replace(/^521/, "52");
+  const convOf = async (to) =>
+    ((await api("/api/conversations")).json?.conversations ?? []).find((c) => c.contact.phone === to);
+  const inbound = (from, text, id) =>
+    api("/api/dev/wa-mock/inbound", {
+      method: "POST",
+      body: JSON.stringify({
+        phoneNumberId: PN,
+        from,
+        name: `Lead 025 ${RUN}`,
+        text,
+        waMessageId: `wamid.e2e.025.${id}.${RUN}`,
+      }),
+    });
+  const lastBody = async (to) => (await outboundTo(to)).at(-1)?.body?.text?.body ?? "";
+  const truth = async (convId, qs) =>
+    (await bot(`/api/bot/availability?conversationId=${convId}${qs}`)).json;
+  const NEGACION = /no (hay|tengo|me quedan)|agenda (llena|completa)|sin disponibilidad/i;
+  // El API del cerebro externo habla en 24 h (es para una máquina); el mensaje
+  // que lee el prospecto va en 12 h. Para comparar, se traduce.
+  const a12 = (hhmm) => {
+    const [h, m] = hhmm.split(":").map(Number);
+    return `${h % 12 === 0 ? 12 : h % 12}:${String(m).padStart(2, "0")} ${h < 12 ? "am" : "pm"}`;
+  };
+
+  // Un lead por pregunta; la primera respuesta es la oferta normal (sugerencias).
+  const ask = async (suffix, primera, pregunta) => {
+    const from = `52146${RUN}${suffix}`;
+    const to = norm(from);
+    await inbound(from, primera, `${suffix}a`);
+    const n = await waitTurn(to, 0);
+    await inbound(from, pregunta, `${suffix}b`);
+    await waitTurn(to, n);
+    return { from, to, conv: await convOf(to), body: await lastBody(to) };
+  };
+
+  // 1. «¿Tienes más horarios mañana?»
+  const m = await ask("41", "quiero agendar una cita", "¿Tienes más horarios mañana?");
+  const dia = await truth(m.conv.id, "&day=mañana");
+  ok(
+    "«¿más horarios mañana?»: el mensaje es EXACTAMENTE la respuesta del motor para ese día",
+    m.body === dia.resumen && m.body.length > 0,
+    JSON.stringify({ body: m.body, resumen: dia.resumen })
+  );
+  ok(
+    "…y la respuesta es EXHAUSTIVA (no una lista truncada): metadatos coherentes con lo enviado",
+    dia.exhaustive === true &&
+      dia.hasMore === false &&
+      dia.scopeComplete === true &&
+      dia.total === dia.slots.length,
+    JSON.stringify({ e: dia.exhaustive, h: dia.hasMore, t: dia.total, n: dia.slots.length })
+  );
+  if (dia.slots.length > 0) {
+    const primero = a12(dia.slots[0].time);
+    const ultimo = a12(dia.slots.at(-1).time);
+    ok(
+      "el día completo llega hasta el ÚLTIMO horario libre (no se detiene en las primeras opciones)",
+      m.body.includes(ultimo) && m.body.includes(primero),
+      m.body
+    );
+    ok("no hay ninguna negación cuando SÍ hay agenda", !NEGACION.test(m.body), m.body);
+  } else {
+    ok("día sin agenda: la respuesta lo explica con causa real", /no atiendo|ya no me quedan|aviso mínimo/.test(m.body), m.body);
+  }
+
+  // 2. «¿Lunes a las 11 o 12?»
+  const h = await ask("42", "quiero agendar una cita", "¿Lunes a las 11 o 12?");
+  const lunes = await truth(h.conv.id, "&day=lunes");
+  const libres = new Set(lunes.slots.map((s) => s.time));
+  const dice = (t) => new RegExp(`a las ${a12(t)} sí tengo|libre a las [^.]*${a12(t)}`).test(h.body);
+  ok(
+    "«¿lunes a las 11 o 12?»: cada hora se contesta según el motor (libre ⇔ el motor la lista)",
+    ["11:00", "12:00"].every((t) => libres.has(t) === dice(t)),
+    JSON.stringify({ libres: [...libres].filter((t) => ["11:00", "12:00"].includes(t)), body: h.body })
+  );
+  ok("nombra el día completo (fecha) para que el prospecto corrija si no era ese", /lunes, \d+ de \w+/i.test(h.body), h.body);
+
+  // 3. «¿El lunes a las 4 o 5 de la tarde?» y después ELIGE una: prueba de que lo consultado es seleccionable.
+  const t = await ask("43", "quiero agendar una cita", "¿El lunes a las 4 o 5 de la tarde?");
+  const tarde = new Set((await truth(t.conv.id, "&day=lunes")).slots.map((s) => s.time));
+  ok(
+    "«¿lunes a las 4 o 5 de la tarde?»: 16:00 y 17:00 contestadas según el motor",
+    ["16:00", "17:00"].every(
+      (x) =>
+        tarde.has(x) ===
+        new RegExp(`libre a las [^.]*${a12(x)}|a las ${a12(x)} sí tengo`).test(t.body)
+    ),
+    t.body
+  );
+  const nT = (await outboundTo(t.to)).length;
+  await inbound(t.from, "sí, agenda el primero", "43c");
+  await waitTurn(t.to, nT);
+  const cT = await convOf(t.to);
+  const citasT = ((await api("/api/bookings")).json?.bookings ?? []).filter(
+    (b) => b.contact?.id === cT.contact.id && (b.status === "agendada" || b.status === "realizada")
+  );
+  ok(
+    "lo que el agente consultó es SELECCIONABLE tras aceptarlo Meta: una cita real",
+    citasT.length === 1,
+    JSON.stringify(citasT.map((b) => b.id))
+  );
+
+  // 4. «¿Cuál es el horario más tarde?»
+  const e = await ask("44", "quiero agendar una cita", "¿Cuál es el horario más tarde el lunes?");
+  const dl = await truth(e.conv.id, "&day=lunes");
+  ok(
+    "«el horario más tarde»: coincide con el ÚLTIMO libre que lista el motor",
+    dl.slots.length === 0
+      ? /no atiendo|ya no me quedan/.test(e.body)
+      : e.body.includes(`a las ${a12(dl.slots.at(-1).time)}`),
+    JSON.stringify({ body: e.body, ultimo: dl.slots.at(-1)?.time })
+  );
+
+  // 5. API del cerebro externo: valores por defecto y metadatos honestos.
+  const def = await truth(e.conv.id, "");
+  const diasSlots = new Set(def.slots.map((s) => s.dayIso));
+  ok(
+    "GET /api/bot/availability sin parámetros: valores por defecto reales (antes, 1 hueco y 1 día)",
+    def.slots.length > 1 || def.total <= 1,
+    JSON.stringify({ n: def.slots.length, total: def.total })
+  );
+  ok(
+    "…declara si la lista es parcial (hasMore ⇔ total > devueltos) y `diasConAgenda` cubre todos los días mostrados",
+    def.hasMore === def.total > def.slots.length &&
+      def.exhaustive === !def.hasMore &&
+      [...diasSlots].every((d) => def.diasConAgenda.includes(d)) &&
+      def.scopeComplete === true,
+    JSON.stringify({ hasMore: def.hasMore, total: def.total, n: def.slots.length, dias: def.diasConAgenda })
+  );
+  const mala = await bot(`/api/bot/availability?conversationId=${e.conv.id}&day=cuando%20puedas`);
+  ok("un día que no se entiende es 422 (jamás una lista vacía que parezca «no hay»)", mala.res.status === 422, JSON.stringify(mala.json));
+
+  // 6. (revisión correctiva) Perfil HEREDADO con «Usa offer_slots»: el simulador de modelo lo obedece
+  //    (ofrece horarios aunque el cliente pida un día/hora/«la semana que viene») y es la compuerta del
+  //    SERVIDOR la que tiene que reconducirlo a la consulta directa. El perfil se restaura al terminar.
+  const perfilActual = (await api("/api/agent/profile")).json?.profile ?? {};
+  const HEREDADA =
+    "Cuando el cliente pregunte por horarios o disponibilidad, Usa offer_slots para mostrarle los horarios.";
+  await api("/api/agent/profile", { method: "PUT", body: JSON.stringify({ instructions: HEREDADA }) });
+  try {
+    const CLARIFICA = /¿Para qué día quieres que lo revise\?/;
+    const w = await ask("45", "quiero agendar una cita", "¿Tienes disponibilidad la semana que viene?");
+    ok(
+      "perfil con «Usa offer_slots» + «la semana que viene»: el prospecto recibe la ACLARACIÓN del servidor, sin horarios",
+      CLARIFICA.test(w.body) && !/\d{1,2}:\d{2}/.test(w.body),
+      w.body
+    );
+    const l = await ask("46", "quiero agendar una cita", "¿Puedes el lunes a las 11 o 12?");
+    const lunesL = await truth(l.conv.id, "&day=lunes");
+    const libresL = new Set(lunesL.slots.map((s) => s.time));
+    ok(
+      "perfil con «Usa offer_slots» + «lunes a las 11 o 12»: se contesta según el motor (no una lista genérica)",
+      ["11:00", "12:00"].every((x) => libresL.has(x) === new RegExp(`libre a las [^.]*${x}|a las ${x} sí tengo`).test(l.body)),
+      l.body
+    );
+    // Lo genérico sigue siendo offer_slots: la regla heredada se aplica donde corresponde.
+    const g = await ask("47", "quiero agendar una cita", "sí, quiero ver los horarios");
+    ok(
+      "…y una petición genérica de opciones («quiero ver los horarios») sigue ofreciendo sugerencias",
+      /\d{1,2}:\d{2}/.test(g.body) && !CLARIFICA.test(g.body),
+      g.body
+    );
+  } finally {
+    await api("/api/agent/profile", {
+      method: "PUT",
+      body: JSON.stringify({ instructions: perfilActual.instructions ?? null }),
+    });
+  }
+}
+
+/* ============================================================
+ * 026 — Aclaraciones de disponibilidad (tests/e2e/us-aclaraciones-disponibilidad.md)
+ *
+ * Corre a la hora REAL del reloj (sin reloj falseado, a diferencia de las
+ * pruebas de integración): cada aserción compara contra un ORÁCULO —
+ * `GET /api/bot/availability` con la MISMA consulta— en vez de fechas fijas,
+ * para no depender de en qué día de la semana se ejecute el self-test.
+ * ============================================================ */
+
+async function aclaracionesDisponibilidadChecks() {
+  console.log(
+    "\n== 026: aclaraciones de disponibilidad (calificador de semana, días alternativos, memoria entre turnos) =="
+  );
+  const norm = (p) => p.replace(/^521/, "52");
+  const convOf = async (to) =>
+    ((await api("/api/conversations")).json?.conversations ?? []).find((c) => c.contact.phone === to);
+  const inbound = (from, text, id) =>
+    api("/api/dev/wa-mock/inbound", {
+      method: "POST",
+      body: JSON.stringify({
+        phoneNumberId: PN,
+        from,
+        name: `Lead 026 ${RUN}`,
+        text,
+        waMessageId: `wamid.e2e.026.${id}.${RUN}`,
+      }),
+    });
+  const lastBody = async (to) => (await outboundTo(to)).at(-1)?.body?.text?.body ?? "";
+  const truth = async (convId, qs) => (await bot(`/api/bot/availability?conversationId=${convId}${qs}`)).json;
+
+  // 1. «jueves o viernes»: días alternativos, contra el oráculo de CADA día por separado.
+  {
+    const from = `52146${RUN}51`;
+    const to = norm(from);
+    await inbound(from, "quiero agendar una cita", "1a");
+    const n0 = await waitTurn(to, 0);
+    await inbound(from, "¿Jueves o viernes?", "1b");
+    await waitTurn(to, n0);
+    const conv = await convOf(to);
+    const body = await lastBody(to);
+    const jueves = await truth(conv.id, "&day=jueves");
+    const viernes = await truth(conv.id, "&day=viernes");
+    ok(
+      "«jueves o viernes» describe AMBOS días, cada uno con datos reales del motor (oráculo)",
+      (jueves.slots.length === 0 || body.includes(jueves.resumen.split(".")[0])) &&
+        (viernes.slots.length === 0 || body.includes(viernes.resumen.split(".")[0])),
+      JSON.stringify({ body, jueves: jueves.resumen, viernes: viernes.resumen })
+    );
+  }
+
+  // 2. Memoria entre turnos: «la semana que viene» (aclara) → «el lunes» SOLO (hereda
+  //    el calificador). El oráculo es la MISMA consulta completa ("lunes de la
+  //    próxima semana"): si el servidor heredó bien, coinciden.
+  {
+    const from = `52146${RUN}52`;
+    const to = norm(from);
+    await inbound(from, "quiero agendar una cita", "2a");
+    const n0 = await waitTurn(to, 0);
+    await inbound(from, "¿Tienes disponibilidad la semana que viene?", "2b");
+    const n1 = await waitTurn(to, n0);
+    const clarifyBody = await lastBody(to);
+    ok(
+      "«la semana que viene» (sin día) pide aclarar el día, sin horarios",
+      /¿Para qué día quieres que lo revise\?/.test(clarifyBody) && !/\d{1,2}:\d{2}/.test(clarifyBody),
+      clarifyBody
+    );
+    // «para el lunes» a secas (sin "horarios"/"a las") — el ai-mock de prueba necesita
+    // una palabra gatillo explícita para reconocer la consulta (el modelo real no; ver
+    // el prompt real, que no exige esas palabras). "tienes horarios" se la da.
+    await inbound(from, "el lunes, ¿tienes horarios?", "2c");
+    await waitTurn(to, n1);
+    const conv = await convOf(to);
+    const inherited = await lastBody(to);
+    const oracle = await truth(conv.id, `&day=${encodeURIComponent("lunes de la próxima semana")}`);
+    ok(
+      "«el lunes» solo, tras «la semana que viene»: el servidor hereda el calificador (coincide con el oráculo completo)",
+      inherited === oracle.resumen,
+      JSON.stringify({ inherited, oracle: oracle.resumen })
+    );
+  }
+
+  // 3. Límite de aclaraciones: 3 intentos consecutivos sin resolver ⇒ handoff, sin repetir texto.
+  //    «la semana que viene» (sin día) es una expresión que el ai-mock SIEMPRE reconoce como
+  //    check_availability (spec 025 §5.2) y que el servidor JAMÁS resuelve sola (026 §8, fuera
+  //    de alcance): repetirla es la forma determinista de forzar 3 aclaraciones seguidas.
+  {
+    const from = `52146${RUN}53`;
+    const to = norm(from);
+    await inbound(from, "quiero agendar una cita", "3a");
+    let n = await waitTurn(to, 0);
+    await inbound(from, "¿tienes disponibilidad la semana que viene?", "3b");
+    n = await waitTurn(to, n);
+    const first = await lastBody(to);
+    await inbound(from, "¿y la semana que viene, tienes algo?", "3c");
+    n = await waitTurn(to, n);
+    const second = await lastBody(to);
+    ok("la 2.ª aclaración consecutiva NO repite el texto de la 1.ª", second !== first && second.length > 0, JSON.stringify({ first, second }));
+    await inbound(from, "en serio, la semana que viene", "3d");
+    n = await waitTurn(to, n);
+    const third = await lastBody(to);
+    ok(
+      "la 3.ª aclaración consecutiva escala a un humano en vez de preguntar de nuevo",
+      !/¿Para qué día|¿Esta semana/.test(third) && third.length > 0,
+      third
+    );
+    const conv = await convOf(to);
+    ok(
+      "la conversación queda en handoff con la razón `agenda_ambigua`",
+      conv.handoffReason === "agenda_ambigua" && conv.handoffAt != null,
+      JSON.stringify({ handoffReason: conv.handoffReason, handoffAt: conv.handoffAt })
+    );
+  }
 }
 
 /* ============================================================
@@ -2017,12 +2779,12 @@ async function agendaChecks() {
     }),
   });
   // A diferencia de /api/bot/*, un inbound real pasa por el debounce de
-  // AGENT_COALESCE_MS antes de correr el turno: se sondea hasta que el
-  // saliente exista, en vez de leer el outbox una sola vez tras una pausa.
-  const msgMax = (
-    await esperarMensaje(LEAD_MAX, () => true, { desde: desdeMax })
-  ).ultimo;
-
+  // AGENT_COALESCE_MS (6000ms por defecto) antes de correr el turno, y en
+  // frío el servidor de desarrollo compila las rutas del turno bajo demanda:
+  // se espera el MENSAJE (condición observable), no un tiempo fijo.
+  let nMax = await waitTurn(LEAD_MAX_NORM, 0);
+  const outboxMax = (await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [];
+  const msgMax = outboxMax.filter((o) => o.to === LEAD_MAX_NORM).pop();
   ok(
     "Max respondió ofreciendo horarios",
     typeof msgMax?.body?.text?.body === "string",
@@ -2073,7 +2835,7 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.015.max.${RUN}.2`,
     }),
   });
-  await esperarMensaje(LEAD_MAX, () => true, { desde: desdeMax });
+  nMax = await waitTurn(LEAD_MAX_NORM, nMax);
 
   const convsMax1 = (await api("/api/conversations")).json?.conversations ?? [];
   const convMax = convsMax1.find((c) => c.contact.phone === LEAD_MAX_NORM);
@@ -2124,7 +2886,12 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.015.max.${RUN}.3`,
     }),
   });
-  await esperarMensaje(LEAD_MAX, () => true, { desde: desdeMax });
+  // El turno termina cuando el traspaso YA está aplicado y el aviso salió.
+  await waitConversation(
+    LEAD_MAX_NORM,
+    (c) => c.handoffReason === "reprogramacion"
+  );
+  nMax = await waitTurn(LEAD_MAX_NORM, nMax);
 
   // El traspaso y su aviso se persisten en pasos distintos: se sondea el
   // desenlace en la conversación en vez de suponer que ya está escrito.
@@ -2160,8 +2927,7 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.015.max.${RUN}.4`,
     }),
   });
-  await esperarMensaje(LEAD_MAX, () => true, { desde: desdeMax });
-  desdeMax = await marcaOutbox();
+  nMax = await waitTurn(LEAD_MAX_NORM, nMax);
   await api("/api/dev/wa-mock/inbound", {
     method: "POST",
     body: JSON.stringify({
@@ -2172,9 +2938,13 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.015.max.${RUN}.5`,
     }),
   });
-  const ultimoMax = (
-    await esperarMensaje(LEAD_MAX, () => true, { desde: desdeMax })
-  ).ultimo;
+  nMax = await waitTurn(LEAD_MAX_NORM, nMax);
+
+  // El último mensaje que recibió el prospecto: tiene que avisar de la cita
+  // que YA tiene, nunca confirmar una nueva.
+  const ultimoMax = ((await api("/api/dev/wa-mock/outbox")).json?.outbox ?? [])
+    .filter((o) => o.to === LEAD_MAX_NORM)
+    .pop();
 
   const bookingsTrasMax2 = (await api("/api/bookings")).json?.bookings ?? [];
   const activasMax2 = bookingsTrasMax2.filter(
@@ -2288,7 +3058,7 @@ async function agendaChecks() {
   // El agente ofreció lunes/martes/miércoles a las 09:00, el prospecto pidió
   // "el miércoles pero no a las 9 am" y recibió LOS MISMOS TRES. `offer_slots`
   // no tenía cómo decir "miércoles" y el motor no tenía cómo filtrar.
-  const LEAD_DIA = `52146${RUN}08`;
+  const LEAD_DIA = `52146${RUN}90`;
   const LEAD_DIA_NORM = LEAD_DIA.replace(/^521/, "52");
   const NOMBRE_DIA = `Lead otro día ${RUN}`;
 
@@ -2328,20 +3098,23 @@ async function agendaChecks() {
     !oferta2.includes("NO-RECIBI-DIAS"),
     oferta2
   );
+  // Desde 025/026 pedir un día es `check_availability`: la respuesta es PROSA
+  // sobre la agenda real de ese día, no otra lista de viñetas. Lo que se
+  // protege sigue siendo lo mismo: que NO sea la repetición de lo ya visto.
   ok(
-    "la segunda oferta NO es idéntica a la primera",
-    b2.length > 0 && b2.join("|") !== b1.join("|"),
-    `1=${b1.join("|")} 2=${b2.join("|")}`
+    "la segunda respuesta NO es la repetición de la primera",
+    oferta2.length > 0 && oferta2 !== oferta1 && b2.join("|") !== b1.join("|"),
+    `1=${oferta1} 2=${oferta2}`
   );
   ok(
-    "trae varias horas del MISMO día",
-    b2.length >= 2 && new Set(b2.map(diaDe)).size === 1,
+    "habla del DÍA que pidió el cliente, con su fecha",
+    /\b(lunes|martes|miércoles|jueves|viernes|sábado|domingo), \d+ de \w+/i.test(oferta2),
     oferta2
   );
   ok(
-    "no repite las tres horas que el cliente acababa de descartar",
-    b2.filter((l) => b1.map(horaDe).includes(horaDe(l))).length < 3,
-    `${b1.map(horaDe)} vs ${b2.map(horaDe)}`
+    "no se queda en las horas que el cliente acababa de descartar",
+    b1.map(horaDe).filter((h) => h && oferta2.includes(h)).length < 3,
+    `${b1.map(horaDe)} vs ${oferta2}`
   );
 
   // Camino infeliz: un día que el negocio tiene CERRADO.
@@ -2393,7 +3166,7 @@ async function agendaChecks() {
   // Citas, y al escribir de nuevo el agente le respondió "te recuerdo que
   // tienes tu demostración agendada". No consultaba la tabla `booking`: su
   // única fuente era su propio "¡Listo! Te agendé…" del historial.
-  const LEAD_CANCEL = `52146${RUN}07`;
+  const LEAD_CANCEL = `52146${RUN}91`;
   const LEAD_CANCEL_NORM = LEAD_CANCEL.replace(/^521/, "52");
   const NOMBRE_CANCEL = `Lead cita cancelada ${RUN}`;
 
@@ -2488,6 +3261,14 @@ async function agendaChecks() {
     !/confirmar el cambio con el equipo/i.test(trasReagendar),
     trasReagendar
   );
+  // 024 — Va DESPUÉS de las secciones de Max: el ai-mock siempre agenda el
+  // PRIMER hueco ofrecido, y correrlo antes le quitaría a Max el suyo (el
+  // servidor lo rechaza con `slot_taken`, correctamente).
+  await entregaIntegraChecks();
+
+  await disponibilidadDirectaChecks();
+
+  await aclaracionesDisponibilidadChecks();
 
   // Se apaga de vuelta: el resto del guion asume el agente in-process OFF.
   await api("/api/agent/profile", {
@@ -2525,9 +3306,8 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.notas.${RUN}.1`,
     }),
   });
-  // El hecho se escribe DURANTE el turno: esperar a la respuesta del agente
-  // es esperar a que el turno haya terminado de escribirlo.
-  await esperarMensaje(LEAD_NOTAS, () => true, { desde: desdeNotas });
+  // cada turno de update_lead responde «Anotado…»: ése es su fin observable
+  await waitTurn(LEAD_NOTAS_NORM, 0);
 
   const contactoNotas = (
     (await api("/api/conversations")).json?.conversations ?? []
@@ -2564,9 +3344,8 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.notas.${RUN}.2`,
     }),
   });
-  // El hecho se escribe DURANTE el turno: esperar a la respuesta del agente
-  // es esperar a que el turno haya terminado de escribirlo.
-  await esperarMensaje(LEAD_NOTAS, () => true, { desde: desdeNotas });
+  // cada turno de update_lead responde «Anotado…»: ése es su fin observable
+  await waitTurn(LEAD_NOTAS_NORM, 1);
 
   detalleNotas = (await api(`/api/contacts/${contactoNotas?.id}`)).json;
   ok(
@@ -2588,9 +3367,8 @@ async function agendaChecks() {
       waMessageId: `wamid.e2e.notas.${RUN}.3`,
     }),
   });
-  // El hecho se escribe DURANTE el turno: esperar a la respuesta del agente
-  // es esperar a que el turno haya terminado de escribirlo.
-  await esperarMensaje(LEAD_NOTAS, () => true, { desde: desdeNotas });
+  // cada turno de update_lead responde «Anotado…»: ése es su fin observable
+  await waitTurn(LEAD_NOTAS_NORM, 2);
 
   detalleNotas = (await api(`/api/contacts/${contactoNotas?.id}`)).json;
   const notaConflicto = detalleNotas?.aiNotes?.find(

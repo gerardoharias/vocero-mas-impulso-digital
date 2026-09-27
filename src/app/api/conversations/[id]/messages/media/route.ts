@@ -15,6 +15,9 @@ const SEND_ERROR_STATUS: Record<SendError["code"], number> = {
   meta_error: 422,
   meta_unavailable: 503,
   upload_failed: 502,
+  // 024: sólo aplican al reenvío de texto; aquí no ocurren.
+  offer_stale: 409,
+  resend_conflict: 409,
 };
 
 /**

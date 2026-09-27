@@ -39,7 +39,6 @@ describe("buildAgentSystemPrompt — agenda (015)", () => {
       kb: [],
       stages: [],
       agenda: true,
-      offers: [],
     });
     expect(prompt).toContain("offer_slots");
     expect(prompt).not.toContain("→ startUtc:");
@@ -242,18 +241,22 @@ describe("HORARIO DE ATENCIÓN — el modelo deja de inferirlo de una muestra", 
     expect(prompt).not.toContain("HORARIO DE ATENCIÓN");
   });
 
-  it("la regla de pedir OTRO DÍA existe y nombra el campo", () => {
-    // Si alguien la borra, el modelo vuelve a llamar offer_slots a secas y el
-    // cliente recibe otra vez los mismos horarios.
+  it("pedir un día concreto manda a check_availability, no a otra ronda de oferta", () => {
+    // Si alguien borra esta regla, el modelo vuelve a llamar offer_slots a
+    // secas y el cliente recibe otra vez los mismos horarios (incidente
+    // 2026-09-20). Desde las specs 025/026 el camino es check_availability.
     const prompt = buildAgentSystemPrompt({
       profile,
       kb: [],
       stages: [{ name: "Nuevo" }],
       agenda: true,
     });
-    expect(prompt).toContain("`day`");
-    expect(prompt).toContain("EXACTAMENTE los mismos horarios");
-    expect(prompt).toContain("NO filtres tú por hora");
+    expect(prompt).toContain("check_availability es OBLIGATORIA");
+    expect(prompt).toContain(
+      "offer_slots SOLO para una solicitud genérica de opciones"
+    );
+    // Y la muestra que ya vio NO es la agenda completa.
+    expect(prompt).toContain("NUNCA deduzcas la disponibilidad de ellos");
   });
 });
 
@@ -299,7 +302,7 @@ describe("el sesgo a escalar y el objetivo de agendar", () => {
     expect(p).toContain("TU OBJETIVO");
     expect(p).toContain("quede con una cita agendada");
     // Y el puente explícito: dato concreto del cliente → ofrecer horarios.
-    expect(p).toContain("el siguiente paso natural es offer_slots");
+    expect(p).toContain("el siguiente paso natural es ofrecerle horarios");
   });
 
   it("…pero ofrecer no es insistir", () => {

@@ -46,7 +46,10 @@ Reglas de procesamiento:
   Tipos no-texto → mensaje con `type` correspondiente y body NULL (chip). Tipos
   desconocidos → `unsupported`, sin error.
 - `statuses[]` → upgrade monotónico del estado (`sent<delivered<read`; nunca degradar;
-  `failed` registra `error_detail`).
+  `failed` registra `error_detail`). **024**: un `failed` de un mensaje aceptado no
+  cierra el mensaje a ciegas: la política decide por `errors[0].code`
+  (reintentable → el MISMO mensaje pasa a `retrying` y se reenvía su payload
+  íntegro; el resto → `failed`). Ver `specs/024-entrega-integra-mensajes-salientes` §4.
 - `field: "message_template_status_update"` → `value: { event: "APPROVED"|"REJECTED"|"PENDING",
   message_template_id, message_template_name, message_template_language, reason }` →
   actualizar `template.status` (por nombre+idioma u id), idempotente.

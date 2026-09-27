@@ -42,3 +42,10 @@ Thumbs.db
 .dev-media/
 # Capturas y salidas de los self-tests (p. ej. scripts/e2e-responsive.mjs)
 scratch/
+
+# Reportes JSON de las suites de integración en CI
+integration-*.json
+
+# Exports crudos del perfil y la KB de producción (pruebas reales, spec 025): jamás al repo
+agent-profile.json
+kb.json

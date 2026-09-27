@@ -129,6 +129,9 @@ mostrado dejó al agente sin nada que ofrecer cuando el lead pedía otro día.
   tienen agenda: no los inventes.
 - `404 not_found` → conversación inexistente.
 - Clamps: `limit` 1–48 (default 12), `perDay` 1–8, `days` 1–14.
+- **025**: el default 12/3/5 ahora sí se aplica cuando falta el parámetro (antes ganaba el mínimo), y
+  `diasConAgenda` cubre todos los días con agenda de la ventana `days`. Ver
+  [docs/bot-availability-contrato.md](../../../docs/bot-availability-contrato.md).
 - `{"slots":[]}` = agenda sin huecos: ofrece otra salida (handoff), no
   reintentes.
 

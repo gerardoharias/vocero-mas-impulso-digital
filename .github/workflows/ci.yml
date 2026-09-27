@@ -1,6 +1,7 @@
 name: CI
 
-# Los cuatro gates del proyecto, corridos por una máquina en cada PR.
+# Los gates del proyecto, corridos por una máquina en cada PR: `gates` (typecheck, lint,
+# unitarias y build, en las dos configuraciones) e `integration` (Postgres real, specs 024, 025 y 026).
 #
 # Existe sobre todo por los PRs de fuera: quien manda uno no tiene la base de
 # datos ni el `.env` de nadie, así que hoy la única forma de saber si su cambio
@@ -89,3 +90,99 @@ jobs:
       - name: build
         if: ${{ !cancelled() }}
         run: pnpm build
+
+  # Integración con Postgres REAL: specs 024 (entrega íntegra de salientes), 025
+  # (consultas de disponibilidad) y 026 (aclaraciones de disponibilidad). Sin
+  # secretos: nada de esto lee `secrets.*`, y Meta y la IA ni siquiera son
+  # alcanzables (ver `env`).
+  integration:
+    name: integration · postgres · specs 024, 025 y 026
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # Servidor efímero del `services` de abajo. Cada archivo de prueba crea y
+      # borra su propia base `vocero_it_*` aplicando las migraciones de `drizzle/`;
+      # esta base («postgres») no se usa para datos.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Defensa en profundidad: aunque una prueba futura olvidara un mock, las
+      # dos APIs externas apuntan a un puerto cerrado de loopback (y la guardia
+      # de `tests/integration/setup.ts` rechaza cualquier host no-loopback).
+      META_GRAPH_BASE_URL: http://127.0.0.1:9
+      OPENROUTER_BASE_URL: http://127.0.0.1:9
+      # Ningún token real: el arnés fija los suyos de prueba (`vitest.integration.config.ts`).
+      OPENROUTER_API_TOKEN: sk-test-not-real
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: install
+        run: pnpm install --frozen-lockfile
+
+      # Que ninguna suite de integración quede fuera de un grupo (y por tanto de
+      # CI) por olvido, y que las declaradas existan.
+      - name: suites declaradas
+        run: node scripts/ci-integration-suites.mjs coverage
+
+      # Las migraciones de cero sobre una base temporal, con el script que corre
+      # el contenedor al arrancar, y re-ejecutadas.
+      - name: migraciones (base temporal)
+        if: ${{ !cancelled() }}
+        run: node scripts/ci-migrate-check.mjs
+
+      # Cada grupo corre aparte para que el fallo diga QUÉ spec rompió, y el
+      # verificador convierte «no corrió», «se omitió» o «0 pruebas» en un fallo:
+      # un pipeline verde sin haber ejecutado la suite es peor que uno rojo.
+      - name: spec 024 · entrega íntegra de salientes
+        if: ${{ !cancelled() }}
+        run: |
+          pnpm test:integration $(node scripts/ci-integration-suites.mjs filters 024) \
+            --reporter=default --reporter=json --outputFile.json=integration-024.json
+      - name: spec 024 · verificar que corrió completa
+        if: ${{ !cancelled() }}
+        run: node scripts/ci-integration-suites.mjs verify 024 integration-024.json
+
+      - name: spec 025 · consultas de disponibilidad
+        if: ${{ !cancelled() }}
+        run: |
+          pnpm test:integration $(node scripts/ci-integration-suites.mjs filters 025) \
+            --reporter=default --reporter=json --outputFile.json=integration-025.json
+      - name: spec 025 · verificar que corrió completa
+        if: ${{ !cancelled() }}
+        run: node scripts/ci-integration-suites.mjs verify 025 integration-025.json
+
+      - name: spec 026 · aclaraciones de disponibilidad
+        if: ${{ !cancelled() }}
+        run: |
+          pnpm test:integration $(node scripts/ci-integration-suites.mjs filters 026) \
+            --reporter=default --reporter=json --outputFile.json=integration-026.json
+      - name: spec 026 · verificar que corrió completa
+        if: ${{ !cancelled() }}
+        run: node scripts/ci-integration-suites.mjs verify 026 integration-026.json
+
+      - name: aislamiento de red (ni Meta ni OpenRouter reales)
+        if: ${{ !cancelled() }}
+        run: |
+          pnpm test:integration $(node scripts/ci-integration-suites.mjs filters aislamiento) \
+            --reporter=default --reporter=json --outputFile.json=integration-red.json
+      - name: aislamiento de red · verificar que corrió
+        if: ${{ !cancelled() }}
+        run: node scripts/ci-integration-suites.mjs verify aislamiento integration-red.json

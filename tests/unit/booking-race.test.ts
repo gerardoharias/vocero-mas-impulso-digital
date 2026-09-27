@@ -194,6 +194,27 @@ describe("la carrera del hueco", () => {
     expect(inserted).toHaveLength(0);
   });
 
+  it("registerAlternatives:false (agente integrado): devuelve las alternativas pero NO las registra como oferta activa", async () => {
+    const { createSessionBooking } = await import("@/server/agenda/service");
+    primeLookups();
+    insertThrows = { code: "23505" };
+
+    await expect(
+      createSessionBooking({
+        organizationId: "org_1",
+        conversationId: "cv_1",
+        startUtc: SLOT,
+        source: "ai",
+        requireOffer: true,
+        // 024 §5.7: sus horarios viajan con el MENSAJE y nacen `pending`.
+        registerAlternatives: false,
+      })
+    ).rejects.toMatchObject({ code: "slot_taken", slots: [{ label: "mié 5 ago, 9:30 am" }, {}] });
+
+    expect(replaceOffers).not.toHaveBeenCalled();
+    expect(inserted).toHaveLength(0);
+  });
+
   it("el 23505 también se reconoce cuando el driver lo envuelve en `cause`", async () => {
     const { createSessionBooking } = await import("@/server/agenda/service");
     primeLookups();

@@ -53,8 +53,9 @@ export async function listConversations(
   // Bug reportado: un envío rechazado por Meta (131026, etc.) avanzaba
   // `lastMessageAt` igual que uno exitoso — el prospecto se quedaba sin nada
   // y la conversación no se veía "pendiente". Ver server/inbox/pending.ts.
+  // 024: `delivery_unknown` (no se sabe si llegó) también pide atención humana.
   const lastMessageFailedSql = sql<boolean>`(
-    select coalesce(m.direction = 'out' and m.status = 'failed', false)
+    select coalesce(m.direction = 'out' and m.status in ('failed', 'delivery_unknown'), false)
     from message m
     where m.conversation_id = ${schema.conversation.id}
     order by m.created_at desc
@@ -94,7 +95,7 @@ export async function getConversation(
 ) {
   const db = getDb();
   const lastMessageFailedSql = sql<boolean>`(
-    select coalesce(m.direction = 'out' and m.status = 'failed', false)
+    select coalesce(m.direction = 'out' and m.status in ('failed', 'delivery_unknown'), false)
     from message m
     where m.conversation_id = ${schema.conversation.id}
     order by m.created_at desc
@@ -193,6 +194,10 @@ export async function updateConversation(
     set.handoffAt = null;
     set.handoffReason = null;
     set.aiEnabled = patch.aiEnabled ?? true;
+    // 023: reactivar la IA empieza de cero el conteo de fallos consecutivos.
+    set.aiFailCount = 0;
+    set.aiFailKind = null;
+    set.aiFailAt = null;
   }
   if (patch.markRead) set.unreadCount = 0;
 

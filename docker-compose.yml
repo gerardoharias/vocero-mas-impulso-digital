@@ -21,6 +21,10 @@ services:
       OPENROUTER_TRANSCRIBE_MODEL: ${OPENROUTER_TRANSCRIBE_MODEL:-}
       ALLOW_SIGNUP: ${ALLOW_SIGNUP:-}
       AGENT_COALESCE_MS: ${AGENT_COALESCE_MS:-6000}
+      # Reintentos de envío a Meta (spec 024). Opcionales: vacío = valores por defecto.
+      OUTBOX_RETRY_BASE_MS: ${OUTBOX_RETRY_BASE_MS:-}
+      OUTBOX_RETRY_CAP_MS: ${OUTBOX_RETRY_CAP_MS:-}
+      OUTBOX_POLL_MS: ${OUTBOX_POLL_MS:-}
     depends_on:
       postgres:
         condition: service_healthy

@@ -53,6 +53,9 @@ export async function POST(req: Request) {
       aiEnabled: true,
       handoffAt: null,
       handoffReason: null,
+      aiFailCount: 0,
+      aiFailKind: null,
+      aiFailAt: null,
       updatedAt: new Date(),
     })
     .where(eq(schema.conversation.id, conv.id));

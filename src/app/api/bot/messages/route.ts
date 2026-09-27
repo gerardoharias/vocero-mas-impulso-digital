@@ -7,6 +7,14 @@ import { SendError, sendText } from "@/server/inbox/send";
 
 export const dynamic = "force-dynamic";
 
+/**
+ * Versión del contrato de respuesta de este endpoint. v1 (hasta 023): un fallo
+ * temporal de Meta respondía 502/503. v2 (024): un fallo RECUPERABLE responde
+ * `200` con `status: "retrying"`; un resultado ambiguo, `200` con
+ * `status: "delivery_unknown"`. Sólo un rechazo definitivo sigue siendo error.
+ */
+const SEND_CONTRACT = 2;
+
 const bodySchema = z.object({
   conversationId: z.string().min(1),
   text: z.string().min(1).max(4096),
@@ -20,6 +28,12 @@ const bodySchema = z.object({
  *
  * 409 tipados: ai_paused (un humano tomó la conversación) · window_closed ·
  * sandbox_violation.
+ *
+ * 024 — `200` = el mensaje quedó registrado. `status` dice en qué punto:
+ * `pending`/`sent` (Meta lo aceptó) · `retrying` (fallo temporal: el CRM lo
+ * reenvía SOLO, con el mismo texto) · `delivery_unknown` (no se sabe si llegó:
+ * NO se reenvía solo; lo resuelve una persona en la bandeja). Un cerebro
+ * externo jamás debe reenviar un 200. Ver docs/bot-messages-contrato.md.
  */
 export async function POST(req: Request) {
   const denied = requireBotKey(req);
@@ -63,7 +77,13 @@ export async function POST(req: Request) {
       text: body.data.text,
       aiGenerated: true,
     });
-    return Response.json({ messageId: result.messageId });
+    // Contrato v2 (spec 024): `200` significa "el mensaje EXISTE y el CRM se
+    // encarga", no "ya llegó". Ver docs/bot-messages-contrato.md. Un cerebro
+    // externo NO debe reenviar por su cuenta un 200: duplicaría.
+    return Response.json(
+      { messageId: result.messageId, status: result.status ?? null, contract: SEND_CONTRACT },
+      { headers: { "X-Vocero-Send-Contract": String(SEND_CONTRACT) } }
+    );
   } catch (err) {
     if (err instanceof SendError) {
       if (err.code === "window_closed") {

@@ -1,5 +1,5 @@
 import { dayIsoInTz, dayLabelInTz } from "@/lib/time/slots";
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, ne, or } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { newId } from "@/lib/db/ids";
 import { scoped } from "@/lib/db/tenant";
@@ -12,7 +12,142 @@ import { scoped } from "@/lib/db/tenant";
  * en cada ronda (la vigente es siempre la última) y se limpia al reservar.
  */
 
-export type OfferedSlot = { startUtc: string; label: string };
+export type OfferedSlot = {
+  startUtc: string;
+  label: string;
+  /**
+   * 024 — aparece en el TEXTO del mensaje (el catálogo registrado es más ancho
+   * que el menú). Sólo estos se revalidan antes de reenviar. Por omisión, sí.
+   */
+  shown?: boolean;
+};
+
+/**
+ * 024 — Los horarios que un mensaje muestra nacen `pending` (no seleccionables:
+ * el prospecto aún no los ha visto) y ligados a ese mensaje. Se insertan dentro
+ * de la MISMA transacción que el mensaje (`server/outbox`), así que nunca hay
+ * horarios "ofrecidos" sin el mensaje que los ofrece, ni al revés.
+ */
+export type OfferTx = Pick<ReturnType<typeof getDb>, "insert">;
+type UpdateTx = Pick<ReturnType<typeof getDb>, "update">;
+
+/**
+ * 024 — Estado de la RONDA en el mensaje que la mostró (`message.offer_state`).
+ * Es lo que permite saber, MESES después, si un mensaje fallido sigue siendo la
+ * oferta vigente o ya fue sustituido/reservado (las filas de `offered_slot` se
+ * borran al reemplazar; el mensaje conserva el veredicto).
+ */
+async function markRounds(
+  tx: UpdateTx,
+  where: {
+    organizationId: string;
+    conversationId: string;
+    from: ("pending" | "active")[];
+    to: "superseded" | "consumed";
+    exceptMessageId?: string;
+  }
+): Promise<void> {
+  await tx
+    .update(schema.message)
+    .set({ offerState: where.to })
+    .where(
+      scoped(
+        schema.message.organizationId,
+        where.organizationId,
+        and(
+          eq(schema.message.conversationId, where.conversationId),
+          inArray(schema.message.offerState, where.from),
+          where.exceptMessageId
+            ? ne(schema.message.id, where.exceptMessageId)
+            : undefined
+        )
+      )
+    );
+}
+
+export async function insertPendingOffers(
+  tx: OfferTx,
+  input: {
+    organizationId: string;
+    conversationId: string;
+    messageId: string;
+    slots: OfferedSlot[];
+  }
+): Promise<void> {
+  if (input.slots.length === 0) return;
+  await tx.insert(schema.offeredSlot).values(
+    input.slots.map((s) => ({
+      id: newId("offeredSlot"),
+      organizationId: input.organizationId,
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+      state: "pending" as const,
+      startUtc: new Date(s.startUtc),
+      label: s.label,
+      shown: s.shown ?? true,
+    }))
+  );
+}
+
+/**
+ * 024 — Meta aceptó el mensaje que muestra estos horarios: pasan a `active`
+ * (seleccionables) y reemplazan cualquier otra ronda de la conversación. Es
+ * idempotente: sin filas `pending` de ese mensaje no hace nada.
+ */
+export async function activateOffers(messageId: string): Promise<number> {
+  const db = getDb();
+  return db.transaction(async (tx) => {
+    const pending = await tx
+      .select({
+        organizationId: schema.offeredSlot.organizationId,
+        conversationId: schema.offeredSlot.conversationId,
+      })
+      .from(schema.offeredSlot)
+      .where(
+        and(
+          eq(schema.offeredSlot.messageId, messageId),
+          eq(schema.offeredSlot.state, "pending")
+        )
+      )
+      .limit(1);
+    const head = pending[0];
+    if (!head) return 0;
+
+    // Cualquier otra ronda de la conversación queda sustituida (y su mensaje lo sabe).
+    await markRounds(tx, {
+      organizationId: head.organizationId,
+      conversationId: head.conversationId,
+      from: ["pending", "active"],
+      to: "superseded",
+      exceptMessageId: messageId,
+    });
+    await tx
+      .update(schema.message)
+      .set({ offerState: "active" })
+      .where(eq(schema.message.id, messageId));
+    await tx
+      .delete(schema.offeredSlot)
+      .where(
+        scoped(
+          schema.offeredSlot.organizationId,
+          head.organizationId,
+          and(
+            eq(schema.offeredSlot.conversationId, head.conversationId),
+            or(
+              isNull(schema.offeredSlot.messageId),
+              ne(schema.offeredSlot.messageId, messageId)
+            )
+          )
+        )
+      );
+    const activated = await tx
+      .update(schema.offeredSlot)
+      .set({ state: "active" })
+      .where(eq(schema.offeredSlot.messageId, messageId))
+      .returning({ id: schema.offeredSlot.id });
+    return activated.length;
+  });
+}
 
 /** Reemplaza TODA la oferta de la conversación, en una transacción. */
 export async function replaceOffers(
@@ -22,6 +157,14 @@ export async function replaceOffers(
 ): Promise<void> {
   const db = getDb();
   await db.transaction(async (tx) => {
+    // Una ronda nueva sin mensaje propio (API del cerebro externo, re-oferta)
+    // deja obsoleta cualquier oferta anterior que un mensaje fallido conserve.
+    await markRounds(tx, {
+      organizationId,
+      conversationId,
+      from: ["pending", "active"],
+      to: "superseded",
+    });
     await tx
       .delete(schema.offeredSlot)
       .where(
@@ -59,7 +202,12 @@ export async function getOffers(
       scoped(
         schema.offeredSlot.organizationId,
         organizationId,
-        eq(schema.offeredSlot.conversationId, conversationId)
+        and(
+          eq(schema.offeredSlot.conversationId, conversationId),
+          // 024: lo que el prospecto aún no ha visto (mensaje sin aceptar) no
+          // se puede reservar ni se le da al modelo como "ya ofrecido".
+          eq(schema.offeredSlot.state, "active")
+        )
       )
     )
     .orderBy(asc(schema.offeredSlot.startUtc));
@@ -75,15 +223,24 @@ export async function clearOffers(
   conversationId: string
 ): Promise<void> {
   const db = getDb();
-  await db
-    .delete(schema.offeredSlot)
-    .where(
-      scoped(
-        schema.offeredSlot.organizationId,
-        organizationId,
-        eq(schema.offeredSlot.conversationId, conversationId)
-      )
-    );
+  await db.transaction(async (tx) => {
+    // El prospecto reservó: ninguna oferta previa se puede reenviar.
+    await markRounds(tx, {
+      organizationId,
+      conversationId,
+      from: ["pending", "active"],
+      to: "consumed",
+    });
+    await tx
+      .delete(schema.offeredSlot)
+      .where(
+        scoped(
+          schema.offeredSlot.organizationId,
+          organizationId,
+          eq(schema.offeredSlot.conversationId, conversationId)
+        )
+      );
+  });
 }
 
 /**
