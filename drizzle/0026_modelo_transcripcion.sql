@@ -1,0 +1,1 @@
+ALTER TABLE "ai_credentials" ADD COLUMN "transcribe_model" text;

@@ -77,6 +77,17 @@ export function buildAgentSystemPrompt(input: {
    */
   agenda?: boolean;
   /**
+   * ¿Es el PRIMER mensaje que el agente manda en esta conversación?
+   *
+   * Incidente 2026-09-25: el agente abrió tres mensajes seguidos con
+   * "¡Hola! 👋 Soy Tobias…" en mitad de una conversación, y uno de ellos con
+   * un "Con gusto te doy toda la información" que no respondía a lo que el
+   * cliente acababa de decir ("El lunes"). El prompt ya traía el saludo con la
+   * coletilla "para conversaciones nuevas", pero NUNCA le decía al modelo si
+   * ésta lo era: se lo tenía que adivinar del historial, y no lo hacía.
+   */
+  esNueva?: boolean;
+  /**
    * Incidente 2026-09-20 — el horario de atención configurado. Sin esto el
    * modelo dedujo "las demostraciones son en horario de mañana" de una
    * muestra de tres huecos. Tipo estructural inline: este módulo no depende
@@ -159,7 +170,11 @@ export function buildAgentSystemPrompt(input: {
     profile.escalationRules
       ? `Reglas de escalado a humano:\n${profile.escalationRules}`
       : null,
-    profile.greeting ? `Saludo sugerido para conversaciones nuevas: ${profile.greeting}` : null,
+    input.esNueva === false
+      ? "ESTA CONVERSACIÓN YA VIENE EN CURSO: no saludes, no te presentes y no vuelvas a decir quién eres — ya lo hiciste. Entra directo a responder lo último que dijo el cliente."
+      : profile.greeting
+        ? `Saludo para ABRIR esta conversación (es el primer mensaje que le mandas): ${profile.greeting}`
+        : null,
     input.agenda ? AGENDA_PRIORITY_CLAUSE : null,
     `CONOCIMIENTO DEL NEGOCIO (tu única fuente de verdad; si algo no está aquí, NO lo inventes — dilo con naturalidad y sigue la conversación):\n${renderKb(input.kb)}`,
 

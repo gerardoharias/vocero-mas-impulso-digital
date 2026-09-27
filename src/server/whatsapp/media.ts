@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { getEnv } from "@/lib/env";
 import { transcribeAudio } from "@/lib/ai";
+import { resolveAiConfig } from "@/server/ai/credentials";
 import { graphRequest, MetaApiError } from "@/lib/meta/client";
 import { publish } from "@/server/events/bus";
 import {
@@ -263,7 +264,8 @@ export async function ensureAssetAvailable(
       const transcription = transcribeAndCaption(
         assetId,
         data,
-        result.mimeType ?? "audio/ogg"
+        result.mimeType ?? "audio/ogg",
+        organizationId
       );
       if (opts?.awaitTranscription) {
         await transcription;
@@ -353,9 +355,16 @@ function sleep(ms: number): Promise<void> {
 async function transcribeAndCaption(
   assetId: string,
   data: Buffer,
-  mimeType: string
+  mimeType: string,
+  organizationId: string
 ): Promise<void> {
-  const result = await transcribeAudio({ data, mimeType });
+  // El modelo de transcripción y el token salen de Ajustes → IA de ESTE
+  // negocio; sin fila configurada, `resolveAiConfig` devuelve {} y
+  // `transcribeAudio` cae a las variables de entorno.
+  const aiConfig = await resolveAiConfig(organizationId, {
+    transcribe: true,
+  }).catch(() => ({}));
+  const result = await transcribeAudio({ data, mimeType, aiConfig });
   const db = getDb();
 
   async function findMessage() {

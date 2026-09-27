@@ -873,6 +873,16 @@ export const aiCredentials = pgTable(
     model: text("model").notNull(),
     /** Modelo del juez del Laboratorio; null ⇒ reusa `model`. */
     judgeModel: text("judge_model"),
+    /**
+     * Modelo que transcribe las notas de voz; null ⇒ reusa `model`.
+     *
+     * Incidente 2026-09-25: el modelo del agente (`z-ai/glm-5.3-flash`) no
+     * acepta audio y el proveedor devolvió 404 "No endpoints found that
+     * support input audio". Ningún modelo de esa familia lo acepta, así que
+     * hace falta uno aparte — y el negocio tiene que poder elegirlo sin entrar
+     * al hosting.
+     */
+    transcribeModel: text("transcribe_model"),
     /** `error` SE ESCRIBE cuando el proveedor rechaza el token. */
     status: text("status", { enum: ["connected", "error"] })
       .notNull()

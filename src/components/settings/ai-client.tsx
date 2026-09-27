@@ -24,6 +24,7 @@ type Connection = {
   tokenLast4: string;
   model: string;
   judgeModel: string | null;
+  transcribeModel: string | null;
 };
 
 export function AiClient() {
@@ -31,6 +32,7 @@ export function AiClient() {
   const [token, setToken] = useState("");
   const [model, setModel] = useState("");
   const [judgeModel, setJudgeModel] = useState("");
+  const [transcribeModel, setTranscribeModel] = useState("");
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [message, setMessage] = useState<{
@@ -47,6 +49,7 @@ export function AiClient() {
         if (data.connection) {
           setModel(data.connection.model);
           setJudgeModel(data.connection.judgeModel ?? "");
+          setTranscribeModel(data.connection.transcribeModel ?? "");
         }
       }
       setLoaded(true);
@@ -56,7 +59,12 @@ export function AiClient() {
   async function submit(mode: "test" | "save") {
     setBusy(true);
     setMessage(null);
-    const body = { token, model, judgeModel: judgeModel.trim() || undefined };
+    const body = {
+      token,
+      model,
+      judgeModel: judgeModel.trim() || undefined,
+      transcribeModel: transcribeModel.trim() || undefined,
+    };
     const res = await fetch(mode === "test" ? "/api/settings/ai/test" : "/api/settings/ai", {
       method: mode === "test" ? "POST" : "PUT",
       headers: { "content-type": "application/json" },
@@ -148,6 +156,26 @@ export function AiClient() {
             <p className="text-xs text-text-3">
               Solo lo usa el Laboratorio al calificar las conversaciones de
               prueba.
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="ai-transcribe-model">
+              Modelo para notas de voz (opcional)
+            </Label>
+            <Input
+              id="ai-transcribe-model"
+              value={transcribeModel}
+              placeholder="Si lo dejas vacío, usa el modelo de arriba"
+              onChange={(e) => setTranscribeModel(e.target.value)}
+            />
+            <p className="text-xs text-text-3">
+              Transcribe los audios que manda el cliente. El modelo de arriba
+              casi nunca acepta audio: si no pones uno que sí (por ejemplo{" "}
+              <code className="rounded bg-secondary px-1">
+                google/gemini-2.5-flash-lite
+              </code>
+              ), el agente tendrá que pedirle al cliente que escriba su mensaje.
             </p>
           </div>
         </div>

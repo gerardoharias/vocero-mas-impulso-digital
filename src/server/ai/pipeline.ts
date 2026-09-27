@@ -416,6 +416,9 @@ export async function runAgentTurn(
     stages,
     agenda,
     businessHours,
+    // Si ya le mandamos algo, esta conversación NO es nueva: el saludo sobra
+    // (incidente 2026-09-25, tres "¡Hola! 👋" seguidos).
+    esNueva: !history.some((m) => m.direction === "out"),
   });
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt },

@@ -1441,6 +1441,7 @@ async function aiChecks() {
       token: "token-bueno-e2e",
       model: "modelo-e2e",
       judgeModel: "modelo-juez-e2e",
+      transcribeModel: "modelo-audio-e2e",
     }),
   });
   ok("token válido se guarda", buenas.res.ok, `status=${buenas.res.status}`);
@@ -1449,6 +1450,18 @@ async function aiChecks() {
     buenas.json?.connection?.tokenLast4 === "-e2e" &&
       !JSON.stringify(buenas.json).includes("token-bueno-e2e"),
     JSON.stringify(buenas.json)
+  );
+
+  // Incidente 2026-09-25: la nota de voz murió con 404 porque el modelo del
+  // agente no acepta audio. El de transcripción se elige aquí, y tiene que
+  // sobrevivir a la ida y vuelta (guardar → releer) como el del juez.
+  const releida = (await api("/api/settings/ai")).json?.connection;
+  ok(
+    "el modelo de las notas de voz se guarda y se relee, aparte del agente y del juez",
+    releida?.transcribeModel === "modelo-audio-e2e" &&
+      releida?.model === "modelo-e2e" &&
+      releida?.judgeModel === "modelo-juez-e2e",
+    JSON.stringify(releida)
   );
 
   const probar = await api("/api/settings/ai/test", { method: "POST", body: JSON.stringify({}) });

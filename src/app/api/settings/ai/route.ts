@@ -31,6 +31,7 @@ export const GET = withAuth(async (session) => {
       tokenLast4: tokenLast4(creds.token),
       model: creds.model,
       judgeModel: creds.judgeModel,
+      transcribeModel: creds.transcribeModel,
     },
   });
 });
@@ -39,6 +40,7 @@ const credsSchema = z.object({
   token: z.string().trim().min(1),
   model: z.string().trim().min(1),
   judgeModel: z.string().trim().optional(),
+  transcribeModel: z.string().trim().optional(),
 });
 
 /** Guarda validando ANTES contra el proveedor: un token que no sirve no llega a la base. */
@@ -63,6 +65,7 @@ export const PUT = withAuth(async (session, req: Request) => {
       tokenLast4: tokenLast4(body.data.token),
       model: body.data.model,
       judgeModel: body.data.judgeModel?.trim() || null,
+      transcribeModel: body.data.transcribeModel?.trim() || null,
     },
   });
 });

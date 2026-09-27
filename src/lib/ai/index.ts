@@ -849,10 +849,28 @@ function audioFormatFromMime(mimeType: string): string {
 export async function transcribeAudio(input: {
   data: Buffer;
   mimeType: string;
+  /**
+   * Config de la ORGANIZACIÓN, ya resuelta por quien llama
+   * (`resolveAiConfig(orgId, { transcribe: true })`). Sin ella se cae a las
+   * variables de entorno, como antes.
+   *
+   * Incidente 2026-09-25: esto leía SOLO `process.env`, así que una instancia
+   * que configuró su token y su modelo en Ajustes → IA seguía transcribiendo
+   * con los del entorno.
+   */
+  aiConfig?: { apiToken?: string; model?: string };
 }): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
-  if (!isAiConfigured()) return { ok: false, error: "not_configured" };
+  const orgToken = input.aiConfig?.apiToken?.trim();
+  // Mismo criterio que `chatJson`: con token de organización NO se exige el
+  // del entorno — si no, una instancia sin variables nunca transcribiría.
+  if (!orgToken && !isAiConfigured()) {
+    return { ok: false, error: "not_configured" };
+  }
   const env = getEnv();
-  const model = env.OPENROUTER_TRANSCRIBE_MODEL ?? env.OPENROUTER_MODEL;
+  const model =
+    input.aiConfig?.model?.trim() ||
+    env.OPENROUTER_TRANSCRIBE_MODEL ||
+    env.OPENROUTER_MODEL;
   if (!model?.trim()) return { ok: false, error: "not_configured" };
 
   const result = await chatJson(

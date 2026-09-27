@@ -183,6 +183,13 @@
       "when": 1790532293552,
       "tag": "0025_slim_felicia_hardy",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790543289755,
+      "tag": "0026_modelo_transcripcion",
+      "breakpoints": true
     }
   ]
 }

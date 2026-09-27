@@ -15,6 +15,8 @@ export type AiCreds = {
   token: string;
   model: string;
   judgeModel: string | null;
+  /** Modelo que transcribe notas de voz; null ⇒ reusa `model`. */
+  transcribeModel: string | null;
   status: "connected" | "error";
 };
 
@@ -47,6 +49,7 @@ export async function getAiCredentials(
         }),
         model: row.model,
         judgeModel: row.judgeModel,
+        transcribeModel: row.transcribeModel,
         status: row.status,
       }
     : null;
@@ -59,6 +62,7 @@ export async function saveAiCredentials(input: {
   token: string;
   model: string;
   judgeModel?: string | null;
+  transcribeModel?: string | null;
 }): Promise<void> {
   const db = getDb();
   const enc = encryptSecret(input.token);
@@ -68,6 +72,9 @@ export async function saveAiCredentials(input: {
     tokenTag: enc.tag,
     model: input.model,
     judgeModel: input.judgeModel?.trim() ? input.judgeModel.trim() : null,
+    transcribeModel: input.transcribeModel?.trim()
+      ? input.transcribeModel.trim()
+      : null,
     status: "connected" as const,
   };
   await db
@@ -118,10 +125,14 @@ export function tokenLast4(token: string): string {
  */
 export async function resolveAiConfig(
   organizationId: string,
-  opts?: { judge?: boolean }
+  opts?: { judge?: boolean; transcribe?: boolean }
 ): Promise<{ apiToken?: string; model?: string }> {
   const creds = await getAiCredentials(organizationId);
   if (!creds) return {};
-  const model = opts?.judge ? (creds.judgeModel ?? creds.model) : creds.model;
+  const model = opts?.judge
+    ? (creds.judgeModel ?? creds.model)
+    : opts?.transcribe
+      ? (creds.transcribeModel ?? creds.model)
+      : creds.model;
   return { apiToken: creds.token, model };
 }

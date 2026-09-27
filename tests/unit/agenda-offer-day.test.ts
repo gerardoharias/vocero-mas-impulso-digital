@@ -105,6 +105,20 @@ describe("offerSlots — el menú genérico", () => {
     expect(dias.size).toBeGreaterThan(1);
   });
 
+  it("las opciones salen en ORDEN cronológico", async () => {
+    // Incidente 2026-09-25: el prospecto recibió "11:00 am, 1:00 pm, 10:30 am".
+    // Una lista desordenada le hace dudar de si hay más horarios o si el
+    // agente se está equivocando.
+    computeAvailability.mockResolvedValue(libres("2026-08-05", "2026-08-07"));
+    const { offerSlots } = await import("@/server/agenda/agent");
+
+    const turn = await offerSlots({ organizationId: "org_1", conversationId: "cv_1" });
+
+    const instantes = (turn.offers ?? []).filter((o) => o.shown).map((o) => Date.parse(o.startUtc));
+    expect(instantes.length).toBeGreaterThan(1);
+    expect(instantes).toEqual([...instantes].sort((a, b) => a - b));
+  });
+
   it("la intro optimista del modelo NO se pega cuando no hay nada que listar", async () => {
     // El modelo escribe "Claro, aquí tienes horarios:" dando por hecho que
     // habrá lista, y al prospecto le llegaba esa frase SOLA. La versión de

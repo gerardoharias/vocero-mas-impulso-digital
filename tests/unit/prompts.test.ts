@@ -261,6 +261,56 @@ describe("HORARIO DE ATENCIÓN — el modelo deja de inferirlo de una muestra", 
 });
 
 /**
+ * Incidente 2026-09-25 — el agente abrió TRES mensajes seguidos con
+ * "¡Hola! 👋 Soy Tobias…" en mitad de la conversación, y uno de ellos con un
+ * "Con gusto te doy toda la información" que no venía a cuento: el cliente
+ * acababa de decir "El lunes".
+ *
+ * El saludo ya decía "para conversaciones nuevas", pero nada le decía al
+ * modelo si ésta lo era.
+ */
+describe("el saludo es para ABRIR, no para cada mensaje", () => {
+  const conSaludo = {
+    ...profile,
+    greeting: "¡Hola! 👋 Soy Tobias, de Tobaxis.",
+  };
+
+  it("conversación nueva: el saludo configurado viaja al prompt", () => {
+    const prompt = buildAgentSystemPrompt({
+      profile: conSaludo,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+      esNueva: true,
+    });
+    expect(prompt).toContain("¡Hola! 👋 Soy Tobias, de Tobaxis.");
+    expect(prompt).not.toContain("YA VIENE EN CURSO");
+  });
+
+  it("conversación en curso: el saludo NO viaja, y se prohíbe explícitamente", () => {
+    const prompt = buildAgentSystemPrompt({
+      profile: conSaludo,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+      esNueva: false,
+    });
+    expect(prompt).not.toContain("¡Hola! 👋 Soy Tobias, de Tobaxis.");
+    expect(prompt).toContain("YA VIENE EN CURSO");
+    expect(prompt).toContain("no saludes");
+  });
+
+  it("sin el dato, se comporta como antes: el saludo está disponible", () => {
+    // Un llamador que no lo pase (el Laboratorio, /api/bot/*) no debe perder
+    // el saludo por omisión.
+    const prompt = buildAgentSystemPrompt({
+      profile: conSaludo,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+    });
+    expect(prompt).toContain("¡Hola! 👋 Soy Tobias, de Tobaxis.");
+  });
+});
+
+/**
  * Incidente 2026-09-20 (segundo) — un prospecto preguntó si Vocero se integra
  * con ERPs, el agente respondió BIEN desde el knowledge base y preguntó qué
  * sistema usaba. El prospecto contestó "Salesforce" y el agente lo transfirió
