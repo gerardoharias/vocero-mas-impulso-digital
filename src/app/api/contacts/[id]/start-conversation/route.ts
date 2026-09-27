@@ -1,5 +1,6 @@
 import { eq } from "drizzle-orm";
 import { z } from "zod";
+import { MAX_TEMPLATE_BODY_CHARS } from "@/lib/templates";
 import { apiError, parseBody, withAuth } from "@/lib/api";
 import { getDb, schema } from "@/lib/db";
 import { scoped } from "@/lib/db/tenant";
@@ -19,7 +20,13 @@ type Params = { params: Promise<{ id: string }> };
 
 const bodySchema = z.object({
   templateId: z.string().min(1),
-  variables: z.array(z.string().trim().max(500)).max(10).optional(),
+  // Tope por valor = el del cuerpo entero: una plantilla genérica lleva en
+  // {{1}} todo lo que el operador escribió. El largo real (cuerpo ya
+  // renderizado ≤ 1024) lo valida `sendTemplate`, que dice cuánto sobra.
+  variables: z
+    .array(z.string().trim().max(MAX_TEMPLATE_BODY_CHARS))
+    .max(10)
+    .optional(),
 });
 
 /**

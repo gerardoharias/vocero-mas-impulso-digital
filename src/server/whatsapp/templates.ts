@@ -1,7 +1,10 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import {
+  canBeWindowFallback,
   countVariables,
+  MAX_TEMPLATE_BODY_CHARS,
   renderBody,
+  sanitizeTemplateParam,
   validateBodyVariables,
 } from "@/lib/templates";
 import { getDb, schema } from "@/lib/db";
@@ -61,6 +64,7 @@ export function serializeTemplate(t: TemplateRow) {
     body: t.body,
     status: t.status,
     rejectionReason: t.rejectionReason,
+    isWindowFallback: t.isWindowFallback,
   };
 }
 
@@ -155,6 +159,9 @@ export async function createTemplate(
         status: "pending",
         rejectionReason: null,
         waTemplateId,
+        // Un cuerpo nuevo que ya no tiene exactamente una variable no puede
+        // seguir envolviendo lo que escribe el operador.
+        ...(canBeWindowFallback(input.body) ? {} : { isWindowFallback: false }),
         updatedAt: new Date(),
       },
     })
@@ -297,9 +304,11 @@ export async function sendTemplate(input: {
   // Meta exige EXACTAMENTE un parámetro por variable del cuerpo: si sobran o
   // falta alguno responde 132000 (plantilla y parámetros no coinciden).
   const variableCount = countVariables(template.body);
+  // Saneado SIEMPRE (no solo en la genérica): un salto de línea en cualquier
+  // parámetro es un 132018 seguro de Meta.
   const values = (input.variables ?? [])
     .slice(0, variableCount)
-    .map((v) => v.trim());
+    .map(sanitizeTemplateParam);
   if (values.length < variableCount || values.some((v) => !v)) {
     const missing = values.findIndex((v) => !v);
     const n = missing === -1 ? values.length + 1 : missing + 1;
@@ -308,6 +317,13 @@ export async function sendTemplate(input: {
       variableCount === 1
         ? "La plantilla requiere el valor de {{1}}"
         : `La plantilla requiere ${variableCount} valores: falta {{${n}}}`
+    );
+  }
+  const rendered = renderBody(template.body, values);
+  if (rendered.length > MAX_TEMPLATE_BODY_CHARS) {
+    throw new TemplateError(
+      "invalid",
+      `El mensaje queda en ${rendered.length} caracteres y WhatsApp admite hasta ${MAX_TEMPLATE_BODY_CHARS}: acórtalo ${rendered.length - MAX_TEMPLATE_BODY_CHARS}`
     );
   }
 
@@ -382,7 +398,7 @@ export async function sendTemplate(input: {
       waMessageId,
       direction: "out",
       type: "template",
-      text: renderBody(template.body, values),
+      text: rendered,
       status: "pending",
       origin: "template",
     })
@@ -403,4 +419,67 @@ export async function sendTemplate(input: {
   });
 
   return { messageId: message.id };
+}
+
+/**
+ * Marca (o desmarca) la plantilla genérica de la organización: con la ventana
+ * cerrada, lo que el operador escribe sale envuelto en ésta. A lo más una por
+ * organización — la transacción desmarca la anterior y el índice único
+ * parcial `template_org_window_fallback_uq` cierra la carrera.
+ */
+export async function setWindowFallback(
+  organizationId: string,
+  templateId: string,
+  enabled: boolean
+): Promise<TemplateRow> {
+  const db = getDb();
+  const rows = await db
+    .select()
+    .from(schema.template)
+    .where(
+      scoped(
+        schema.template.organizationId,
+        organizationId,
+        eq(schema.template.id, templateId)
+      )
+    )
+    .limit(1);
+  const template = rows[0];
+  if (!template) throw new TemplateError("not_found", "Plantilla no encontrada");
+  if (enabled && !canBeWindowFallback(template.body)) {
+    throw new TemplateError(
+      "invalid",
+      "La plantilla genérica debe tener exactamente una variable {{1}}"
+    );
+  }
+
+  return await db.transaction(async (tx) => {
+    if (enabled) {
+      await tx
+        .update(schema.template)
+        .set({ isWindowFallback: false, updatedAt: new Date() })
+        .where(
+          scoped(
+            schema.template.organizationId,
+            organizationId,
+            and(
+              eq(schema.template.isWindowFallback, true),
+              ne(schema.template.id, templateId)
+            )
+          )
+        );
+    }
+    const updated = await tx
+      .update(schema.template)
+      .set({ isWindowFallback: enabled, updatedAt: new Date() })
+      .where(
+        scoped(
+          schema.template.organizationId,
+          organizationId,
+          eq(schema.template.id, templateId)
+        )
+      )
+      .returning();
+    return updated[0]!;
+  });
 }

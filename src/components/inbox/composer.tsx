@@ -13,6 +13,7 @@ import {
 import type { ConversationDto, TemplateDto } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { formatBytes, formatRemaining } from "./helpers";
+import { FallbackComposer } from "./fallback-composer";
 import { TemplateSender } from "./template-sender";
 
 /** 008 — Panel secundario del clip: formulario de ubicación o contacto. */
@@ -44,6 +45,7 @@ export function Composer({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [templates, setTemplates] = useState<TemplateDto[]>([]);
+  const [templatesLoaded, setTemplatesLoaded] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [filePreview, setFilePreview] = useState<string | null>(null);
   const [panel, setPanel] = useState<AttachPanel>(null);
@@ -62,7 +64,10 @@ export function Composer({
         if (!cancelled)
           setTemplates((d.templates ?? []).filter((t) => t.status === "approved"));
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setTemplatesLoaded(true);
+      });
     return () => {
       cancelled = true;
     };
@@ -198,6 +203,31 @@ export function Composer({
   }
 
   if (!conversation.windowOpen) {
+    // Mientras llega la lista no se decide el modo: pintar el selector y
+    // cambiarlo a los 200 ms por el campo de texto sería un parpadeo.
+    if (!templatesLoaded) {
+      return (
+        <div className="border-t bg-background px-[18px] py-3.5">
+          <p className="text-xs text-muted-foreground">Cargando plantillas…</p>
+        </div>
+      );
+    }
+    // La plantilla genérica envuelve lo que se escribe (solo WhatsApp: es el
+    // canal cuya política fuera de ventana es "plantilla").
+    const fallback =
+      conversation.channel === "whatsapp"
+        ? templates.find((t) => t.isWindowFallback)
+        : undefined;
+    if (fallback) {
+      return (
+        <FallbackComposer
+          key={conversation.id}
+          conversationId={conversation.id}
+          template={fallback}
+          onSent={onSent}
+        />
+      );
+    }
     return (
       <div className="border-t bg-background px-[18px] py-3.5">
         <div className="mb-3 flex items-start gap-2 rounded-md border border-warning-soft bg-warning-tint p-3 text-sm text-warning-text">
@@ -212,6 +242,16 @@ export function Composer({
           </div>
         </div>
         <TemplateSender conversationId={conversation.id} onSent={onSent} />
+        {conversation.channel === "whatsapp" && templates.length > 0 && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            ¿Quieres escribir libremente? Marca una plantilla de una sola
+            variable como genérica en{" "}
+            <a href="/settings/templates" className="text-primary hover:underline">
+              Configuración → Plantillas
+            </a>
+            .
+          </p>
+        )}
       </div>
     );
   }
