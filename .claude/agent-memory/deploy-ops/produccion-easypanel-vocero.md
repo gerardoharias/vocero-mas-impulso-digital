@@ -77,5 +77,6 @@ solo se actualiza al terminar.
 contenedor no levanta. No hay arranque a medias.
 
 **Cómo aplicar**: para "¿está al día producción?", comparar
-`inspectAppService().commit.sha` contra `git rev-parse HEAD` local — hoy es la
-ÚNICA fuente fiable.
+`inspectAppService().commit.sha` contra `git rev-parse HEAD` local. Si no hay
+acceso a la plataforma, el sondeo de la ruta nueva (arriba) contesta la misma
+pregunta con un `curl` público.
