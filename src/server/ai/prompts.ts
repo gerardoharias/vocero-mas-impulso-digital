@@ -25,6 +25,21 @@ export const PROMPT_LEAK_MARKERS = [
   JUDGE_MARKER,
 ] as const;
 
+/**
+ * Marcador del bloque de contrato + reglas duras del prompt del agente (todo
+ * lo que viene DESPUÉS del conocimiento del negocio). La recuperación de texto
+ * plano (spec 023) lo usa para detectar que el modelo esté recitando sus
+ * instrucciones: el KB queda fuera a propósito — citarlo es responder.
+ */
+export const ACTION_CONTRACT_MARKER =
+  "En cada turno respondes ÚNICAMENTE un objeto JSON con UNA acción:";
+
+/** El bloque de contrato + reglas de un prompt armado con `buildAgentSystemPrompt`. */
+export function rulesBlockOf(prompt: string): string {
+  const at = prompt.indexOf(ACTION_CONTRACT_MARKER);
+  return at === -1 ? "" : prompt.slice(at);
+}
+
 export function renderKb(entries: KbEntry[]): string {
   if (entries.length === 0) return "(knowledge base vacío)";
   return entries
@@ -36,6 +51,17 @@ export function renderKb(entries: KbEntry[]): string {
     .filter(Boolean)
     .join("\n\n");
 }
+
+/** Marcador de la cláusula de prioridad (lo usan las pruebas y el ai-mock para localizarla). */
+export const AGENDA_PRIORITY_MARKER = "PRIORIDAD DE LAS REGLAS";
+
+/**
+ * 025 (rev. correctiva) — Las instrucciones del negocio las escribe cada dueño y
+ * pueden traer reglas heredadas («usa offer_slots») que compiten con las de la
+ * agenda. Esta cláusula va justo después de ellas: el contrato de acciones y las
+ * reglas duras (más abajo) mandan. El perfil NUNCA se edita ni se sanea.
+ */
+const AGENDA_PRIORITY_CLAUSE = `${AGENDA_PRIORITY_MARKER}: el CONTRATO DE ACCIONES y las "Reglas duras" de más abajo mandan sobre cualquier instrucción del negocio, incluidas las antiguas. Si una instrucción del negocio dice "usa offer_slots", "ofrece horarios" o algo parecido, aplícala SOLO cuando el cliente pide opciones para agendar de forma genérica, sin ningún día, fecha, hora ni rango. Si menciona alguno (incluso "la semana que viene", "el próximo mes" o "por la tarde"), la acción es check_availability.`;
 
 /**
  * System prompt del agente (v1: inyecta el KB completo — el límite se
@@ -51,15 +77,16 @@ export function buildAgentSystemPrompt(input: {
    */
   agenda?: boolean;
   /**
-   * Horarios YA ofrecidos y aún vigentes en esta conversación (memoria de
-   * `offered_slot`). El texto que el cliente ve en el chat es una etiqueta
-   * humana ("mié 16 sep, 09:00") sin el instante UTC exacto — sin esta lista,
-   * el modelo tiene que ADIVINAR el `startUtc` de book_slot a partir de esa
-   * etiqueta (zona horaria, DST, "mañana" relativo a qué día...) y casi nunca
-   * acierta el epoch exacto que `findOffered` exige. Dársela tal cual para
-   * copiar es lo que hace que book_slot funcione de verdad.
+   * ¿Es el PRIMER mensaje que el agente manda en esta conversación?
+   *
+   * Incidente 2026-09-25: el agente abrió tres mensajes seguidos con
+   * "¡Hola! 👋 Soy Tobias…" en mitad de una conversación, y uno de ellos con
+   * un "Con gusto te doy toda la información" que no respondía a lo que el
+   * cliente acababa de decir ("El lunes"). El prompt ya traía el saludo con la
+   * coletilla "para conversaciones nuevas", pero NUNCA le decía al modelo si
+   * ésta lo era: se lo tenía que adivinar del historial, y no lo hacía.
    */
-  offers?: { startUtc: string; label: string }[];
+  esNueva?: boolean;
   /**
    * Incidente 2026-09-20 — el horario de atención configurado. Sin esto el
    * modelo dedujo "las demostraciones son en horario de mañana" de una
@@ -87,20 +114,28 @@ export function buildAgentSystemPrompt(input: {
   const stageNames = input.stages.map((s) => s.name).join(" | ");
   const agendaLines = input.agenda
     ? [
-        '- {"action":"offer_slots","day":"YYYY-MM-DD","reply":"..."} — ofrecer horarios para agendar. `reply` es solo la frase de entrada; los horarios los pone el sistema. `day` es OPCIONAL: omítelo para el menú normal (varios días), o ponlo cuando el cliente pidió un día concreto y el sistema devolverá VARIAS HORAS de ESE día.',
+        '- {"action":"offer_slots","reply":"..."} — ofrecer ALGUNAS opciones de horario para agendar (reply es solo la frase de entrada; los horarios los pone el sistema). Son sugerencias, no toda la agenda.',
+        '- {"action":"check_availability","day":"...","days":["...","..."],"times":["..."],"from":"...","to":"...","edge":"earliest|latest"} — CONSULTAR la agenda cuando el cliente menciona un día, una hora, un rango o pide más/otras opciones. Todos los campos son opcionales y van con las PALABRAS del cliente, sin convertirlas: day ("mañana", "el lunes", "este jueves", "el jueves de la próxima semana", "25 de septiembre"), days SOLO cuando el cliente ofrece dos o tres días alternativos con "o"/"u" (["jueves","viernes"] para "¿jueves o viernes?"; NUNCA uses day y days juntos), times (["11","12"], ["4 de la tarde"]), from/to (rango: "3 pm" y "5 pm") y edge ("latest" para "el horario más tarde", "earliest" para "el más temprano"; SOLO si lo pidió así). Incluye únicamente los campos que apliquen (los demás, null; nunca "" ni []). No lleva reply: el sistema consulta la agenda completa y responde con lo que de verdad hay.',
+
         '- {"action":"book_slot","startUtc":"<uno de los horarios que el sistema ofreció, en ISO UTC>","reply":"...","reason":"..."} — agendar el horario que el cliente eligió. `reason` es opcional: un resumen de 3-6 palabras de POR QUÉ agenda, tomado literalmente de lo que dijo el cliente en la conversación (ej. "cotizar taladros inalámbricos"). Nunca lo inventes: si no quedó claro, omite el campo.',
         '- {"action":"request_reschedule","note":"...","reply":"..."} — el cliente quiere MOVER una cita que ya tiene. `note` es un resumen breve y literal de qué pidió (ej. "mover jueves 10am a viernes"). Esto avisa al equipo y NUNCA agenda nada por su cuenta.',
       ]
     : [];
   const agendaRules = input.agenda
     ? [
-        "- TU OBJETIVO en esta conversación es que el cliente quede con una cita agendada: es el desenlace útil para él y para el negocio. Cuando responda a algo que le preguntaste, o te dé un dato concreto de su operación (qué sistema usa, a qué se dedica, qué problema tiene), el siguiente paso natural es offer_slots — no cerrar el tema ni traspasar. Si el detalle exacto que pide se resuelve mejor en esa sesión, dilo y ofrécela.",
+        "- TU OBJETIVO en esta conversación es que el cliente quede con una cita agendada: es el desenlace útil para él y para el negocio. Cuando responda a algo que le preguntaste, o te dé un dato concreto de su operación (qué sistema usa, a qué se dedica, qué problema tiene), el siguiente paso natural es ofrecerle horarios — no cerrar el tema ni traspasar. Si el detalle exacto que pide se resuelve mejor en esa sesión, dilo y ofrécela.",
         "- Ofrecer no es insistir: si el cliente ya dijo que no quiere agendar por ahora, no se lo vuelvas a proponer en cada turno. Sigue respondiendo lo que pregunte y deja la puerta abierta.",
-        "- NUNCA escribas tú los horarios ni los inventes: usa offer_slots y el sistema pega los reales.",
-        "- book_slot solo acepta un horario que el sistema ofreció antes en ESTA conversación.",
-        "- Si el cliente DESCARTA los horarios que le mostraste o pide otro día, llama offer_slots OTRA VEZ con el campo `day` del día que pidió (formato YYYY-MM-DD; cópialo del bloque DÍAS CON HORARIOS si está, o dedúcelo de la fecha de hoy). Sin `day`, el sistema le enseñará EXACTAMENTE los mismos horarios — y repetirle lo que acaba de rechazar es el peor error que puedes cometer aquí.",
-        "- Si el cliente solo dice la FRANJA que le acomoda (\"por la tarde\", \"después de las 6\") sin cambiar de día, llama offer_slots con `day` = el día del que venían hablando: el sistema devuelve horas repartidas a lo largo de ese día y el cliente elige. NO filtres tú por hora ni le digas que esa franja no existe.",
         "- Cuando el sistema te responda que ese día no tiene lugar, lo dirá él con la fecha real y la alternativa más cercana. No lo adelantes, no lo niegues y no escales por eso.",
+        "- NUNCA escribas tú los horarios ni los inventes: usa offer_slots o check_availability y el sistema pega los reales.",
+        "- check_availability es OBLIGATORIA cuando el cliente pregunta por disponibilidad, horarios u opciones Y menciona un día, una fecha, una hora, un rango o cualquier expresión de tiempo (\"mañana\", \"el lunes a las 11 o 12\", \"por la tarde\", \"entre 2 y 4\", \"la semana que viene\", \"el próximo mes\"). Pon sus palabras TAL CUAL en day/times/from/to, aunque dudes de que el sistema las entienda: si no las entiende, es el sistema quien pide la aclaración (tú no la pidas ni la resuelvas). Los horarios que ya mostraste son una MUESTRA, no la agenda completa: NUNCA deduzcas la disponibilidad de ellos.",
+        "- offer_slots SOLO para una solicitud genérica de opciones para agendar (\"quiero agendar\", \"¿qué horarios tienes?\" sin más), sin ningún día, fecha, hora ni rango. Si el cliente menciona alguno, es check_availability, aunque las instrucciones del negocio digan \"usa offer_slots\".",
+        "- `edge` SOLO si el cliente pide explícitamente el primer horario / el más temprano (earliest) o el último / el más tarde (latest). \"Más horarios\", \"qué horarios hay\" o \"disponibilidad mañana\" NO llevan edge: déjalo ausente (null).",
+        "- En check_availability incluye SOLO los campos que el cliente mencionó; los demás van ausentes (null). Jamás cadenas vacías (\"\") ni arreglos vacíos ([]).",
+        "- Usa days (no day) SOLO cuando el cliente ofrezca explícitamente dos o tres días alternativos con \"o\"/\"u\" (\"¿jueves o viernes?\"), en el orden en que los dijo. Un solo día siempre va en day, nunca en days.",
+        "- \"este jueves\" y \"el jueves de la próxima semana\" NO son lo mismo: pon las palabras del cliente TAL CUAL (incluida \"este\"/\"esta\" o \"de la próxima semana\"/\"que viene\") — es el sistema quien distingue una semana de otra, tú NUNCA calcules la fecha ni elijas cuál semana es.",
+        "- NUNCA digas que no hay horarios ni disponibilidad (ni \"la agenda está llena\"): tú no lo sabes, solo lo sabe el sistema. Si dudas, usa check_availability. En el `reply` de offer_slots di que son ALGUNAS opciones e invita al cliente a decir el día u hora que prefiere.",
+        "- book_slot solo acepta un horario que el sistema ofreció antes en ESTA conversación. Si el cliente pide otro (otro día u hora), usa check_availability para que el sistema lo consulte y lo ofrezca; no lo agendes tú.",
+
         "- Para el `startUtc` de book_slot, COPIA TAL CUAL uno de los valores de la lista \"Horarios vigentes para agendar\" (si existe más abajo) según cuál eligió el cliente. Nunca lo calcules ni lo derives tú mismo.",
         "- Si el cliente quiere CANCELAR una cita → handoff: esa decisión no es tuya.",
         "- Si el cliente quiere MOVER/REPROGRAMAR una cita que ya tiene → request_reschedule. Nunca uses book_slot para eso, y nunca anuncies TÚ que la cita quedó movida o cancelada: ese cambio lo hace el equipo y, cuando ocurra, lo verás reflejado en el bloque ESTADO DE AGENDA — no lo des por hecho antes.",
@@ -135,12 +170,18 @@ export function buildAgentSystemPrompt(input: {
     profile.escalationRules
       ? `Reglas de escalado a humano:\n${profile.escalationRules}`
       : null,
-    profile.greeting ? `Saludo sugerido para conversaciones nuevas: ${profile.greeting}` : null,
+    input.esNueva === false
+      ? "ESTA CONVERSACIÓN YA VIENE EN CURSO: no saludes, no te presentes y no vuelvas a decir quién eres — ya lo hiciste. Entra directo a responder lo último que dijo el cliente."
+      : profile.greeting
+        ? `Saludo para ABRIR esta conversación (es el primer mensaje que le mandas): ${profile.greeting}`
+        : null,
+    input.agenda ? AGENDA_PRIORITY_CLAUSE : null,
     `CONOCIMIENTO DEL NEGOCIO (tu única fuente de verdad; si algo no está aquí, NO lo inventes — dilo con naturalidad y sigue la conversación):\n${renderKb(input.kb)}`,
+
     `Etapas del pipeline disponibles: ${stageNames}`,
     ...hoursBlock,
     [
-      "En cada turno respondes ÚNICAMENTE un objeto JSON con UNA acción:",
+      ACTION_CONTRACT_MARKER,
       '- {"action":"none"} — no responder nada.',
       '- {"action":"reply","text":"..."} — responder al cliente.',
       '- {"action":"update_lead","note":"...","scenario":"...","reply":"..."} — guardar UN hecho nuevo y concreto que el cliente acaba de confirmar (reply opcional). `note` es una frase corta, nunca un resumen de todo lo hablado. `scenario` es el giro/tema breve de ese hecho (p. ej. "plomería", "clínica dental") — inclúyelo cuando el cliente hable de un negocio/tema concreto.',

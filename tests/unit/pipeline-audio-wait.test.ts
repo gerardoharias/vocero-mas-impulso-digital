@@ -49,7 +49,18 @@ function thenableChain(rows: unknown[]) {
 
 vi.mock("@/lib/db", () => ({
   getDb: () => ({
-    select: () => thenableChain(selectQueue.shift() ?? []),
+    select: (fields?: Record<string, unknown>) =>
+      // Con AGENDA encendida el pipeline también lee los horarios ya ofrecidos
+      // (`getOffers`: columnas de `offeredSlot`). Ese select NO forma parte de
+      // la cola posicional de abajo: se responde por lo que consulta, con una
+      // lista vacía válida (aquí no hay horarios ofrecidos). Si no, se tragaría
+      // la fila de otra consulta y el resto de la cola quedaría desfasado.
+      fields &&
+      Object.values(fields).some(
+        (v) => typeof v === "string" && v.startsWith("offeredSlot.")
+      )
+        ? thenableChain([])
+        : thenableChain(selectQueue.shift() ?? []),
     insert: (table: unknown) => ({
       values: (values: unknown) => {
         inserts.push({ table, values });

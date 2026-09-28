@@ -9,6 +9,7 @@ const prefixes = {
   contact: "ct",
   conversation: "cv",
   message: "msg",
+  deliveryAttempt: "mda",
   lead: "ld",
   stage: "stg",
   leadStageEvent: "lse",

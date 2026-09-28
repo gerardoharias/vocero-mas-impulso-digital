@@ -26,7 +26,8 @@ export function isPendingReply(
   lastMessageAt: Date | null,
   now: Date = new Date(),
   /**
-   * true cuando el ÚLTIMO mensaje es un saliente con `status: "failed"`
+   * true cuando el ÚLTIMO mensaje es un saliente con `status: "failed"` (o
+   * `delivery_unknown`, spec 024: no se sabe si llegó y no se reenvía solo)
    * (bug reportado: un envío rechazado por Meta -p. ej. 131026- avanzaba
    * `lastMessageAt` igual que uno exitoso, así que "ya salió algo después
    * del entrante" quedaba en true aunque el prospecto no hubiera recibido

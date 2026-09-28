@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { normalizeAgentActionInput } from "@/server/agenda/query-intent";
 
 /**
  * Acción tipada del agente: exactamente UNA por turno (FR-021).
@@ -54,22 +55,12 @@ const agendaActions = [
   z.object({
     action: z.literal("offer_slots"),
     /**
-     * Incidente 2026-09-20 — el día del que el cliente pidió horarios
-     * (YYYY-MM-DD, zona del negocio). Sin este campo, un cliente que decía
-     * "el miércoles pero no a las 9" recibía EXACTAMENTE los mismos tres
-     * horarios: el modelo no tenía cómo pedir otra cosa.
-     *
-     * Se COPIA del índice "DÍAS CON HORARIOS" que viaja en el contexto; el
-     * modelo no calcula fechas (mismo motivo por el que existe el mapa
-     * `label → startUtc`).
-     *
-     * El esquema NO valida el formato a propósito: `resolveRequestedDay` en
-     * el motor ignora lo que no parezca una fecha y ofrece el menú normal. Un
-     * regex aquí tiraría la acción entera por un campo opcional mal escrito,
-     * gastaría los 3 reintentos de chatJson y podría acabar escalando — que
-     * sería reproducir el incidente por otra vía.
+     * 025/026 — `offer_slots` YA NO lleva día: en cuanto el cliente nombra uno
+     * (o una hora, o un rango) la acción es `check_availability`, que consulta
+     * la agenda completa con SUS palabras en vez de fiarse de que el modelo
+     * calcule la fecha. Dejar aquí un `day` que nadie consume sería peor que
+     * no tenerlo: el modelo lo rellenaría y no pasaría nada.
      */
-    day: z.string().optional(),
     reply: z.string().optional(),
   }),
   z.object({
@@ -93,6 +84,30 @@ const agendaActions = [
      * debe explicar por qué es aparte.
      */
     confirmAdditional: z.boolean().optional(),
+  }),
+  /**
+   * 025 — CONSULTA DIRECTA de disponibilidad. El modelo pasa lo que dijo el
+   * prospecto (día, hora, rango o «el más tarde»); el servidor resuelve las
+   * fechas y horas y responde con el motor evaluado sobre TODO lo pedido. Sin
+   * `reply` a propósito: el modelo no redacta (ni afirma) nada sobre horarios.
+   */
+  z.object({
+    action: z.literal("check_availability"),
+    /** "mañana", "lunes", "25 de septiembre" o ISO. Omitido = todo el horizonte. */
+    day: z.string().optional(),
+    /**
+     * 026 — Días ALTERNATIVOS cuando el cliente ofrece más de uno con «o»/«u»
+     * ("jueves o viernes"), tope 3, en el orden en que los dijo. Mutuamente
+     * excluyente con `day` (si mandas ambos, éste se ignora).
+     */
+    days: z.array(z.string()).optional(),
+    /** Horas concretas, tal como las dijo: ["11", "12"], ["4 de la tarde"]. */
+    times: z.array(z.string()).optional(),
+    /** Rango: "entre las 3 y las 5 pm" → from "3 pm", to "5 pm". */
+    from: z.string().optional(),
+    to: z.string().optional(),
+    /** «el más tarde» / «el más temprano». */
+    edge: z.enum(["earliest", "latest"]).optional(),
   }),
   z.object({
     action: z.literal("request_reschedule"),
@@ -140,11 +155,22 @@ export function degradeAction(action: AgentActionType): AgentActionType {
     action.action === "move_stage" ||
     action.action === "offer_slots" ||
     action.action === "book_slot" ||
+    action.action === "check_availability" ||
     action.action === "request_reschedule"
   ) {
+    // `check_availability` no lleva `reply`: si el motor falla, el pipeline
+    // responde con un texto fijo (nunca una afirmación sobre horarios).
+    if (action.action === "check_availability") return { action: "none" };
     return action.reply
       ? { action: "reply", text: action.reply }
       : { action: "none" };
   }
   return action;
 }
+
+/**
+ * Se aplica a la respuesta cruda del modelo ANTES de validar el esquema (opción
+ * `normalize` de `chatJson`): `""`, espacios y `[]` de `check_availability` son
+ * AUSENCIA. Ver `src/server/agenda/query-intent.ts`.
+ */
+export const normalizeAgentAction = normalizeAgentActionInput;

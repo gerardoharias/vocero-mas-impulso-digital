@@ -6,7 +6,8 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   const guard = mockGuard();
   if (guard) return guard;
-  return Response.json({ outbox: getWaMockState().outbox });
+  const state = getWaMockState();
+  return Response.json({ outbox: state.outbox, rejected: state.rejected });
 }
 
 export async function DELETE() {

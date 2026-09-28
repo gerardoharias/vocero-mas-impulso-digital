@@ -226,6 +226,36 @@ export async function POST(req: Request, ctx: Params) {
   // POST {phoneNumberId}/messages → registra en el outbox
   if (path.length === 2 && path[1] === "messages") {
     const state = getWaMockState();
+    // 024 — Rechazo guionado (`POST /api/dev/wa-mock/fail-next`): Meta NO acepta
+    // el mensaje, así que no entra al outbox (sólo al registro de rechazados).
+    const scripted = state.failNext.shift();
+    if (scripted) {
+      state.rejected.push({
+        n: nextN(),
+        to: String(body.to ?? ""),
+        type: String(body.type ?? "text"),
+        body,
+        status: scripted.status,
+        code: scripted.code ?? null,
+        at: new Date().toISOString(),
+      });
+      if (scripted.code === undefined) {
+        // Sin cuerpo de Meta (proxy/gateway): el CRM no puede saber si lo aceptó.
+        return new Response("Bad Gateway (mock)", { status: scripted.status });
+      }
+      return Response.json(
+        {
+          error: {
+            message: `(mock) error ${scripted.code}`,
+            type: "OAuthException",
+            code: scripted.code,
+            error_subcode: scripted.subcode,
+            fbtrace_id: "mock",
+          },
+        },
+        { status: scripted.status }
+      );
+    }
     // Meta responde 132000 si los parámetros no cuadran con las {{n}} de la
     // plantilla aprobada. El mock lo replica para que un desfase no pase.
     if (body.type === "template") {

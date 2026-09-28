@@ -6,3 +6,4 @@
 - [Diagnóstico "bot no responde"](feedback-bot-no-responde-diagnostico.md) — revisar direction/origin en BD antes de sospechar del pipeline: puede ser mix-up de probar con el CRM abierto
 - [El repo es producto revendible](project-producto-revendible.md) — marca de producto vs. marca por cliente; rename toca DEFAULT_BRANDING + isVoceroName
 - [Entorno del self-test local](project-entorno-selftest-local.md) — postgres en 5433, app en 3100, las 5 variables de mock que .env NO trae, y la agenda que se saturaba tras ~10 corridas (el arnés ya se limpia solo)
+- [Outbox de envíos (024)](project-outbox-024.md) — payload persistido antes del intento; reintento nunca toca IA/agenda; ambiguo ⇒ delivery_unknown, sin reenvío automático

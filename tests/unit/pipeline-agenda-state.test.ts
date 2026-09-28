@@ -24,15 +24,25 @@ const readAgendaState = vi.fn();
 const readBusinessHours = vi.fn();
 const offerSlots = vi.fn();
 const bookSlot = vi.fn();
+const checkAvailability = vi.fn();
 const recordRescheduleRequest = vi.fn();
 vi.mock("@/server/agenda/agent", () => ({
   readAgendaState,
   readBusinessHours,
   offerSlots,
+  checkAvailability,
   bookSlot,
   recordRescheduleRequest,
 }));
-vi.mock("@/server/agenda/offers", () => ({ getOffers: async () => [] }));
+vi.mock("@/server/agenda/offers", () => ({
+  getOffers: async () => [],
+  offerDays: () => [],
+  replaceOffers: async () => {},
+}));
+vi.mock("@/server/whatsapp/presence", () => ({
+  markReadAndTyping: async () => {},
+  TYPING_TTL_MS: 25_000,
+}));
 
 const sendText = vi.fn();
 class FakeSendError extends Error {
@@ -181,6 +191,7 @@ describe("runAgentTurn — el estado real de citas llega al prompt", () => {
     readBusinessHours.mockReset();
     readBusinessHours.mockResolvedValue(undefined);
     offerSlots.mockReset();
+    checkAvailability.mockReset();
     offerSlots.mockResolvedValue({ ok: true, status: "offered", text: "horarios" });
     sendText.mockReset();
     sendText.mockResolvedValue({ messageId: "wam_1" });
@@ -280,12 +291,14 @@ describe("runAgentTurn — el estado real de citas llega al prompt", () => {
     expect(msgs[0]!.content as string).not.toContain(cabecera);
   });
 
-  it("el `day` que pide el modelo LLEGA al motor", async () => {
+  it("el día que pide el cliente LLEGA al motor por check_availability", async () => {
     // Incidente 2026-09-20: el pipeline solo pasaba `intro`, así que el motor
-    // nunca se enteraba de qué día había pedido el cliente y devolvía lo mismo.
+    // nunca se enteraba de qué día había pedido el cliente y devolvía lo
+    // mismo. Desde las specs 025/026 ese camino es `check_availability`, que
+    // viaja con las PALABRAS del cliente en vez de una fecha calculada.
     chatJson.mockResolvedValue({
       ok: true,
-      data: { action: "offer_slots", day: "2026-09-23", reply: "Claro:" },
+      data: { action: "check_availability", day: "el miércoles" },
       raw: "{}",
     });
     queueTurn();
@@ -293,12 +306,15 @@ describe("runAgentTurn — el estado real de citas llega al prompt", () => {
     const { runAgentTurn } = await import("@/server/ai/pipeline");
     await runAgentTurn("cv_1");
 
-    expect(offerSlots).toHaveBeenCalledWith(
-      expect.objectContaining({ day: "2026-09-23" })
+    expect(checkAvailability).toHaveBeenCalledWith(
+      expect.objectContaining({
+        query: expect.objectContaining({ day: "el miércoles" }),
+      })
     );
+    expect(offerSlots).not.toHaveBeenCalled();
   });
 
-  it("sin `day`, el pipeline NO se inventa uno", async () => {
+  it("una petición genérica va por offer_slots, sin inventar día", async () => {
     chatJson.mockResolvedValue({
       ok: true,
       data: { action: "offer_slots", reply: "Claro:" },
@@ -309,9 +325,8 @@ describe("runAgentTurn — el estado real de citas llega al prompt", () => {
     const { runAgentTurn } = await import("@/server/ai/pipeline");
     await runAgentTurn("cv_1");
 
-    expect(offerSlots).toHaveBeenCalledWith(
-      expect.objectContaining({ day: undefined })
-    );
+    expect(offerSlots).toHaveBeenCalled();
+    expect(checkAvailability).not.toHaveBeenCalled();
   });
 
   it("con la agenda APAGADA no se paga la query ni se gasta el token", async () => {

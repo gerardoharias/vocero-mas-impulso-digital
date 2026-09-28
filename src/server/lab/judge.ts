@@ -24,9 +24,10 @@ export type JudgeOutcome =
   | { status: "judge_failed"; detail: string };
 
 /**
- * UNA llamada del juez por conversación. Los reintentos viven dentro de
- * chatJson; si aun así la salida es inválida, el caso queda judge_failed —
- * visible en el reporte y excluido del score. La corrida continúa.
+ * UNA llamada del juez por conversación. Los reintentos y la (única)
+ * corrección viven dentro de chatJson; si aun así la salida es inválida, el
+ * caso queda judge_failed — visible en el reporte y excluido del score. La
+ * corrida continúa.
  */
 export async function judgeCase(input: {
   organizationId: string;
@@ -48,11 +49,17 @@ export async function judgeCase(input: {
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-    { judge: true, ...aiConfig }
+    {
+      judge: true,
+      ...aiConfig,
+      traceId: `lab_${input.personaKey}`,
+      schemaName: "veredicto_juez",
+    }
   );
   if (!result.ok) {
     // Diagnóstico operativo: el caso queda visible como judge_failed y aquí
-    // queda el porqué (incluye el raw= truncado del proveedor).
+    // queda el porqué — el código y un detalle fijo, nunca la salida del juez
+    // (lleva fragmentos del transcript de la conversación).
     console.error(
       `[lab] juez falló para ${input.personaKey}: ${result.error} — ${result.detail}`
     );

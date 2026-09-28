@@ -150,3 +150,38 @@ export function isAiConfigured(): boolean {
   const token = process.env.OPENROUTER_API_TOKEN;
   return typeof token === "string" && token.trim().length > 0;
 }
+
+/**
+ * 023: cómo se pide JSON al proveedor. Lectura viva de `process.env` (como
+ * `isAiConfigured`): no exige que TODO el entorno valide y un cambio en
+ * runtime se nota en la siguiente llamada.
+ * - `auto` (default): json_schema estricto → json_object → sin formato, bajando
+ *   un nivel SOLO ante un rechazo explícito del proveedor y recordándolo.
+ * - valor fijo: sin escalera; un modelo que no lo soporta da un error claro.
+ * Un valor desconocido cae a `auto` (el `warn` lo emite el adaptador).
+ */
+export type ResponseFormatSetting = "auto" | "json_schema" | "json_object" | "off";
+
+export function aiResponseFormatSetting(): {
+  value: ResponseFormatSetting;
+  invalid: boolean;
+} {
+  const raw = process.env.AI_RESPONSE_FORMAT?.trim().toLowerCase();
+  if (!raw) return { value: "auto", invalid: false };
+  if (raw === "auto" || raw === "json_schema" || raw === "json_object" || raw === "off") {
+    return { value: raw, invalid: false };
+  }
+  return { value: "auto", invalid: true };
+}
+
+const DEFAULT_AI_FALLBACK_MESSAGE =
+  "Disculpa, no pude procesar bien tu mensaje. ¿Podrías escribirlo de nuevo, por favor?";
+
+/**
+ * 023: mensaje fijo de degradación cuando el modelo no entregó una respuesta
+ * utilizable. Sin promesas (no hay handoff) y sin contenido del modelo.
+ */
+export function aiFallbackMessage(): string {
+  const custom = process.env.AI_FALLBACK_MESSAGE?.trim();
+  return custom ? custom : DEFAULT_AI_FALLBACK_MESSAGE;
+}

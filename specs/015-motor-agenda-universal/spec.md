@@ -1,5 +1,12 @@
 # Feature Specification: Motor de agendamiento universal (bandera + conectores)
 
+> Ver también [025](../025-consultas-disponibilidad-calendario/spec.md): el agente consulta el motor **de forma
+> directa** (día, hora, rango) y declara si su lista es parcial o completa; el motor de este spec no cambia.
+>
+> Ver también [024 §5.6-5.7](../024-entrega-integra-mensajes-salientes/spec.md): las ofertas de horarios del
+> agente se registran como `pending` con su mensaje y sólo se activan cuando Meta lo acepta;
+> `createSessionBooking` gana la opción `registerAlternatives` (por omisión, el comportamiento de siempre).
+
 **Feature Branch**: `015-motor-agenda-universal`
 
 **Created**: 2026-08-26

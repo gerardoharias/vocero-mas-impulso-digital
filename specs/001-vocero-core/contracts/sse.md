@@ -16,7 +16,11 @@ Connection: keep-alive
   Caddy/Traefik y proxies intermedios).
 - **Eventos** (`event: <tipo>`, `data: <json>`, `id: <epoch_ms>`):
   - `message.new` — `{ conversationId, message: {...} }` (nunca de conversaciones `is_test`)
-  - `message.status` — `{ conversationId, messageId, status }`
+  - `message.status` — `{ conversationId, messageId, status, error? }`. `status` (024,
+    aditivo): `queued` · `sending` · `pending` · `sent` · `delivered` · `read` ·
+    `retrying` · `delivery_unknown` · `failed`. Un cliente que no conozca un estado
+    nuevo debe tratarlo como «en camino» (`queued`/`sending`/`retrying`) o «sin
+    confirmar» (`delivery_unknown`), nunca como entregado.
   - `conversation.updated` — `{ conversation: {...} }` (handoff, unread, last_message_at)
   - `lab.run` — `{ runId, status, progress: {done, total}, score? }`
 - **Catch-up**: el cliente manda `Last-Event-ID` (o el front refetch desde su último

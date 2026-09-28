@@ -61,8 +61,22 @@ export type MessageDto = {
   direction: "in" | "out";
   type: string;
   text: string | null;
-  status: "pending" | "sent" | "delivered" | "read" | "failed";
-  /** Motivo del fallo en lenguaje llano cuando status = "failed". */
+  /**
+   * 024: `queued`/`sending`/`retrying` = en camino ("Reintentando" si hubo un
+   * fallo recuperable); `delivery_unknown` = no se sabe si llegó (no se reenvía
+   * solo); `failed` = terminal (failed_final), con el payload conservado.
+   */
+  status:
+    | "queued"
+    | "sending"
+    | "pending"
+    | "sent"
+    | "delivered"
+    | "read"
+    | "retrying"
+    | "delivery_unknown"
+    | "failed";
+  /** Motivo del fallo en lenguaje llano (status = failed / retrying / delivery_unknown). */
   error: string | null;
   aiGenerated: boolean;
   /** 008 — Origen del saliente (en entrantes viene 'operator' y se ignora). */

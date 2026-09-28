@@ -64,6 +64,9 @@ const SEND_ERROR_STATUS: Record<SendError["code"], number> = {
   meta_error: 422,
   meta_unavailable: 503,
   upload_failed: 502,
+  // 024: la oferta ya no es vigente / otro operador ya reenvió: conflicto de estado.
+  offer_stale: 409,
+  resend_conflict: 409,
 };
 
 export const POST = withAuth(async (session, req: Request, ctx: Params) => {
@@ -93,7 +96,7 @@ export const POST = withAuth(async (session, req: Request, ctx: Params) => {
               kind: "contacts",
               contacts: data.contacts,
             });
-    return Response.json({ messageId: result.messageId });
+    return Response.json({ messageId: result.messageId, status: result.status ?? null });
   } catch (err) {
     if (err instanceof SendError) {
       return apiError(SEND_ERROR_STATUS[err.code], err.code, err.message);

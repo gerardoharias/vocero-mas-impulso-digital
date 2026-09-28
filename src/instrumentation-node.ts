@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { startPendingMessageSweeper } from "@/server/inbox/sweeper";
+import { startOutboxWorker } from "@/server/outbox";
 
 /** Corridas del Laboratorio que quedaron "running" tras un reinicio → fallidas. */
 async function cleanupOrphanRuns(): Promise<void> {
@@ -26,8 +27,12 @@ async function cleanupOrphanRuns(): Promise<void> {
   }
 }
 
-/** Tareas de arranque del runtime Node (FR-034 + sweeper de mensajes colgados). */
+/**
+ * Tareas de arranque del runtime Node (FR-034 + sweeper de mensajes colgados +
+ * trabajador del outbox, spec 024: reanuda los reintentos que dejó un reinicio).
+ */
 export async function runBootTasks(): Promise<void> {
   await cleanupOrphanRuns();
   startPendingMessageSweeper();
+  startOutboxWorker();
 }

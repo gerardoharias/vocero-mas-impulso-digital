@@ -84,8 +84,9 @@ cualquier otra conversación.
 
 | Endpoint | Para qué |
 |---|---|
+| `GET /api/bot/availability` | Horarios para ofrecer. Además de la lista por defecto (**parcial**: mira `hasMore`), acepta `day`/`from`/`to` para la disponibilidad **completa** de un día o rango. Ver [cambios](docs/bot-availability-contrato.md) |
 | `GET /api/bot/context` | Quién es la persona, su etapa, si un humano tomó la conversación y si la ventana de 24 h sigue abierta |
-| `POST /api/bot/messages` | Responder. Sale por el mismo camino que el composer y queda marcado como IA |
+| `POST /api/bot/messages` | Responder. Sale por el mismo camino que el composer y queda marcado como IA. **Un `200` es «el mensaje existe», no «ya llegó»**: `status` puede ser `retrying` (el CRM reintenta solo) o `delivery_unknown` — no lo reenvíes. Ver [contrato v2](docs/bot-messages-contrato.md) |
 | `GET /api/bot/profile` | El perfil del agente y el knowledge base que editaste en la app |
 | `PUT /api/bot/ficha` | Guardar lo que tu bot descubre del lead (claves libres: cada negocio califica distinto) |
 | `POST /api/bot/handoff` | Devolver la conversación a un humano |

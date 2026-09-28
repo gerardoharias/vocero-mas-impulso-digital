@@ -1,8 +1,8 @@
 import { and, eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
-import { describeSendError } from "@/lib/meta/send-errors";
 import { publish } from "@/server/events/bus";
 import type { WebhookStatus } from "@/server/inbox/webhook";
+import { applyAsyncFailure } from "@/server/outbox";
 
 /** Orden monotónico de estados: nunca degradar (un delivered tardío no pisa read). */
 const STATUS_RANK: Record<string, number> = {
@@ -13,6 +13,12 @@ const STATUS_RANK: Record<string, number> = {
 };
 
 type MessageStatus = "pending" | "sent" | "delivered" | "read" | "failed";
+
+/**
+ * Estados que un acuse de Meta puede tocar: sólo mensajes que Meta ya aceptó
+ * (hay `wamid`). `queued`/`sending`/`retrying`/`delivery_unknown` no tienen
+ * `wamid` que un acuse pueda nombrar.
+ */
 
 export function isUpgrade(current: string, next: string): boolean {
   if (next === "failed") return current !== "failed";
@@ -28,13 +34,17 @@ export async function applyStatusUpdate(
 ): Promise<void> {
   const next = status.status;
   if (!(next in STATUS_RANK) && next !== "failed") return; // estado desconocido
+  // Los estados propios del outbox no viajan en los acuses de Meta.
 
   const db = getDb();
   const rows = await db
     .select({
       id: schema.message.id,
+      organizationId: schema.message.organizationId,
       conversationId: schema.message.conversationId,
       status: schema.message.status,
+      deliveryAttempts: schema.message.deliveryAttempts,
+      traceId: schema.message.traceId,
     })
     .from(schema.message)
     .where(
@@ -49,10 +59,29 @@ export async function applyStatusUpdate(
   if (!isUpgrade(msg.status, next)) return;
 
   const failure = status.errors?.[0];
-  const error =
-    next === "failed"
-      ? describeSendError(failure?.code, failure?.message ?? failure?.title)
-      : null;
+
+  if (next === "failed") {
+    // 024: el mismo mensaje, la política por CÓDIGO. Un fallo reintentable
+    // vuelve a `retrying` (misma burbuja); el resto queda `failed`.
+    const applied = await applyAsyncFailure({
+      message: msg,
+      code: failure?.code ?? null,
+      detail: failure?.message ?? failure?.title,
+    });
+    publish(organizationId, {
+      type: "message.status",
+      data: {
+        conversationId: msg.conversationId,
+        messageId: msg.id,
+        status: applied.status,
+        // Sin esto el operador ve el triángulo de fallo pero nunca el motivo.
+        error: applied.error,
+      },
+    });
+    return;
+  }
+
+  const error = null;
 
   await db
     .update(schema.message)

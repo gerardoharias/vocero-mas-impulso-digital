@@ -359,6 +359,8 @@ export const conversation = pgTable(
       // reprogramacion (auditoría 2026-09-17): el cliente pidió mover una cita
       // y no hay una herramienta de reprogramación segura para el agente
       // incluido — se deriva y se bloquea una cita sustitutiva.
+      // agenda_ambigua (026): 3 aclaraciones de disponibilidad consecutivas
+      // sin resolver (regla 15) — sin migración, el `enum` es sólo de TS.
       enum: [
         "cliente",
         "modelo",
@@ -367,11 +369,44 @@ export const conversation = pgTable(
         "hostilidad",
         "manual_reply",
         "reprogramacion",
+        "agenda_ambigua",
       ],
     }),
     lastInboundAt: timestamp("last_inbound_at"),
     lastMessageAt: timestamp("last_message_at"),
     unreadCount: integer("unread_count").notNull().default(0),
+    /**
+     * 023 — Estado TÉCNICO de los fallos de IA de esta conversación, aislado
+     * del texto que ve el cliente (antes se deducía comparando el último
+     * mensaje saliente con el texto de degradación: frágil ante un cambio de
+     * `AI_FALLBACK_MESSAGE`, un mensaje editado o un operador que escribe lo
+     * mismo). `ai_fail_count` = fallos de formato CONSECUTIVOS; se incrementa
+     * de forma atómica en SQL (varias instancias/reinicios sin carreras) y
+     * vuelve a 0 con el siguiente turno exitoso o al reactivar la IA.
+     * `ai_fail_kind` = código del último fallo (o `circuit_open` si el
+     * circuito de protección avisó al cliente); `ai_fail_at` = cuándo.
+     */
+    aiFailCount: integer("ai_fail_count").notNull().default(0),
+    aiFailKind: text("ai_fail_kind"),
+    aiFailAt: timestamp("ai_fail_at"),
+    /**
+     * 026 — Memoria de aclaración de disponibilidad, CONSECUTIVA por
+     * conversación (mismo patrón que `ai_fail_*` de 023, migración 0024).
+     * `agenda_clarify_count`: cuántas aclaraciones seguidas sin resolver
+     * (≥ 3 ⇒ handoff `agenda_ambigua`, regla 15). `agenda_clarify_kind`: la
+     * última razón (`unresolved_day` · `already_passed_this_week` ·
+     * `too_many_days` · `unresolved_time` · `unresolved_range`) — el `enum`
+     * es sólo de TypeScript, agregar razones no exige migración.
+     * `agenda_clarify_context`: JSON acotado (≤ 300 car.) con SÓLO lo ya
+     * entendido (calificador de semana, palabras de día) — nunca el mensaje
+     * completo del cliente ni ningún dato personal (`agenda-clarify-context.ts`
+     * sanea antes de escribir). Se resetea a 0/null/null cuando el turno
+     * resuelve, se crea una cita, cambia de forma inequívoca el tema, o
+     * interviene un humano (cualquier handoff, `applyHandoff`).
+     */
+    agendaClarifyCount: integer("agenda_clarify_count").notNull().default(0),
+    agendaClarifyKind: text("agenda_clarify_kind"),
+    agendaClarifyContext: text("agenda_clarify_context"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
@@ -399,12 +434,57 @@ export const message = pgTable(
     direction: text("direction", { enum: ["in", "out"] }).notNull(),
     type: text("type").notNull().default("text"),
     text: text("text"),
+    /**
+     * 024 — Ciclo de vida del saliente (ver specs/024 §3.1). `queued` →
+     * `sending` → `pending` (Meta aceptó; hay `wamid`) → `sent` → `delivered` →
+     * `read`. Un fallo recuperable pasa por `retrying`; un resultado ambiguo se
+     * queda en `delivery_unknown` (nunca se reenvía solo); `failed` es terminal
+     * (failed_final) y conserva el payload. `status` es `text`: el `enum` es
+     * sólo de TypeScript, agregar estados no exige migración de tipo.
+     */
     status: text("status", {
-      enum: ["pending", "sent", "delivered", "read", "failed"],
+      enum: [
+        "queued",
+        "sending",
+        "pending",
+        "sent",
+        "delivered",
+        "read",
+        "retrying",
+        "delivery_unknown",
+        "failed",
+      ],
     })
       .notNull()
       .default("pending"),
     error: text("error"),
+    /** 024 — Intentos de transporte reclamados (incluye el que está en vuelo). */
+    deliveryAttempts: integer("delivery_attempts").notNull().default(0),
+    /** 024 — Cuándo se puede reclamar el siguiente intento (`retrying`). */
+    nextAttemptAt: timestamp("next_attempt_at"),
+    /** 024 — Arrendamiento del intento en vuelo; vencido ⇒ intento huérfano. */
+    lockedUntil: timestamp("locked_until"),
+    /** 024 — Código/subcódigo de Meta y clase del último fallo (saneados). */
+    errorCode: integer("error_code"),
+    errorSubcode: integer("error_subcode"),
+    errorClass: text("error_class"),
+    /** 024 — Correlación interna (`trc_…`); jamás derivada de datos del cliente. */
+    traceId: text("trace_id"),
+    /**
+     * 024 — Un turno del agente, una respuesta lógica: `agent-turn:<id del
+     * inbound>`. UNIQUE: la segunda inserción del mismo turno no crea otro mensaje.
+     */
+    dedupeKey: text("dedupe_key").unique(),
+    /**
+     * 024 — Estado de la RONDA DE HORARIOS que este mensaje muestra (nulo = no
+     * es una oferta). `pending`: aún no aceptado por Meta, no seleccionable.
+     * `active`: aceptado, seleccionable. `superseded`: una ronda posterior, una
+     * reserva o una revalidación la volvieron obsoleta. `consumed`: el
+     * prospecto reservó. Sólo `pending`/`active` admiten reenviar el mismo texto.
+     */
+    offerState: text("offer_state", {
+      enum: ["pending", "active", "superseded", "consumed"],
+    }),
     aiGenerated: boolean("ai_generated").notNull().default(false),
     /**
      * 008 — Origen del saliente: IA (bot), operador del CRM, manual desde la
@@ -429,6 +509,55 @@ export const message = pgTable(
       t.conversationId,
       t.createdAt
     ),
+    // 024: el barrido del outbox sólo mira lo que está en vuelo.
+    index("message_outbox_due_idx")
+      .on(t.status, t.nextAttemptAt)
+      .where(sql`${t.status} in ('queued','retrying','sending')`),
+  ]
+);
+
+/**
+ * 024 — Un INTENTO de transporte de un mensaje lógico. El mensaje (`message`)
+ * es la única representación visible; sus intentos viven aquí. Nunca guarda el
+ * JSON de error de Meta, el cuerpo enviado (es `message.text`, inmutable) ni el
+ * destinatario: sólo código, subcódigo, clase, HTTP status y `wamid`.
+ */
+export const messageDeliveryAttempt = pgTable(
+  "message_delivery_attempt",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    messageId: text("message_id")
+      .notNull()
+      .references(() => message.id, { onDelete: "cascade" }),
+    attemptNo: integer("attempt_no").notNull(),
+    stage: text("stage", { enum: ["sync", "async"] }).notNull(),
+    outcome: text("outcome", {
+      enum: [
+        "started",
+        "accepted",
+        "transient_failure",
+        "rate_limited",
+        "ambiguous",
+        "permanent_failure",
+        "async_failed",
+        "abandoned",
+      ],
+    }).notNull(),
+    errorClass: text("error_class"),
+    metaCode: integer("meta_code"),
+    metaSubcode: integer("meta_subcode"),
+    httpStatus: integer("http_status"),
+    wamid: text("wamid"),
+    traceId: text("trace_id"),
+    startedAt: timestamp("started_at").notNull().defaultNow(),
+    finishedAt: timestamp("finished_at"),
+  },
+  (t) => [
+    uniqueIndex("message_delivery_attempt_msg_no_uq").on(t.messageId, t.attemptNo),
+    index("message_delivery_attempt_org_idx").on(t.organizationId),
   ]
 );
 
@@ -744,6 +873,16 @@ export const aiCredentials = pgTable(
     model: text("model").notNull(),
     /** Modelo del juez del Laboratorio; null ⇒ reusa `model`. */
     judgeModel: text("judge_model"),
+    /**
+     * Modelo que transcribe las notas de voz; null ⇒ reusa `model`.
+     *
+     * Incidente 2026-09-25: el modelo del agente (`z-ai/glm-5.3-flash`) no
+     * acepta audio y el proveedor devolvió 404 "No endpoints found that
+     * support input audio". Ningún modelo de esa familia lo acepta, así que
+     * hace falta uno aparte — y el negocio tiene que poder elegirlo sin entrar
+     * al hosting.
+     */
+    transcribeModel: text("transcribe_model"),
     /** `error` SE ESCRIBE cuando el proveedor rechaza el token. */
     status: text("status", { enum: ["connected", "error"] })
       .notNull()
@@ -1062,8 +1201,33 @@ export const offeredSlot = pgTable(
     /** La etiqueta EXACTA que se le mostró al cliente. */
     label: text("label").notNull(),
     offeredAt: timestamp("offered_at").notNull().defaultNow(),
+    /**
+     * 024 — El mensaje lógico que mostró estos horarios. Nulo = oferta sin
+     * mensaje propio (API del cerebro externo; la re-oferta del agente sí lleva mensaje, spec 024 §5.7).
+     */
+    messageId: text("message_id").references(() => message.id, {
+      onDelete: "cascade",
+    }),
+    /**
+     * 024 — `pending`: el mensaje que los muestra aún no fue aceptado por Meta,
+     * así que el prospecto no los ha visto y NO son seleccionables. `active`:
+     * seleccionables (todo lo anterior a 024 lo es).
+     */
+    state: text("state", { enum: ["pending", "active"] })
+      .notNull()
+      .default("active"),
+    /**
+     * 024 — El horario aparece en el TEXTO del mensaje (el catálogo registrado
+     * es más ancho que el menú que se muestra). Sólo estos se revalidan antes
+     * de reenviar: lo que el prospecto no ve no puede dejar obsoleta la oferta.
+     * Las filas anteriores a 024 quedan `true` (comportamiento idéntico).
+     */
+    shown: boolean("shown").notNull().default(true),
   },
-  (t) => [index("offered_slot_conv_idx").on(t.conversationId, t.startUtc)]
+  (t) => [
+    index("offered_slot_conv_idx").on(t.conversationId, t.startUtc),
+    index("offered_slot_message_idx").on(t.messageId),
+  ]
 );
 
 /**

@@ -6,22 +6,42 @@ import { getEnv } from "@/lib/env";
  * por graphRequest. En self-test, META_GRAPH_BASE_URL apunta al wa-mock.
  */
 
+/**
+ * 024 — Cómo falló la conexión cuando NO hubo respuesta HTTP (`status: 0`):
+ * `connect` = la petición nunca llegó a Meta (seguro reintentar); `timeout` y
+ * `unknown` = pudo haber llegado (resultado ambiguo: no se reenvía solo).
+ */
+export type NetworkPhase = "connect" | "timeout" | "unknown";
+
 export class MetaApiError extends Error {
   status: number;
   code: number | null;
+  /** 024: `error.error_subcode` de Meta, si vino. */
+  subcode: number | null;
   type: string | null;
   details: unknown;
+  /** 024: sólo con `status: 0` (no hubo respuesta). */
+  network: NetworkPhase | null;
 
   constructor(
     message: string,
-    opts: { status: number; code?: number | null; type?: string | null; details?: unknown }
+    opts: {
+      status: number;
+      code?: number | null;
+      subcode?: number | null;
+      type?: string | null;
+      details?: unknown;
+      network?: NetworkPhase | null;
+    }
   ) {
     super(message);
     this.name = "MetaApiError";
     this.status = opts.status;
     this.code = opts.code ?? null;
+    this.subcode = opts.subcode ?? null;
     this.type = opts.type ?? null;
     this.details = opts.details;
+    this.network = opts.network ?? null;
   }
 
   /**
@@ -36,12 +56,30 @@ export class MetaApiError extends Error {
   }
 }
 
+/** Códigos de red que prueban que la petición NUNCA salió hacia Meta. */
+const NEVER_REACHED = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
+
+/** Clasifica la excepción de `fetch` (undici envuelve la causa real en `.cause`). */
+export function networkPhaseOf(cause: unknown): NetworkPhase {
+  const c = cause as
+    | { name?: string; code?: string; cause?: { code?: string; name?: string } }
+    | null
+    | undefined;
+  const names = [c?.name, c?.cause?.name];
+  if (names.includes("TimeoutError") || names.includes("AbortError")) return "timeout";
+  const codes = [c?.code, c?.cause?.code];
+  if (codes.some((x) => typeof x === "string" && NEVER_REACHED.has(x))) return "connect";
+  return "unknown";
+}
+
 export async function graphRequest<T>(
   path: string,
   opts: {
     method?: "GET" | "POST" | "DELETE";
     token: string;
     body?: unknown;
+    /** 024: tope de espera. Vencido ⇒ MetaApiError con `network: "timeout"`. */
+    timeoutMs?: number;
   }
 ): Promise<T> {
   const env = getEnv();
@@ -57,11 +95,14 @@ export async function graphRequest<T>(
           : {}),
       },
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      signal:
+        opts.timeoutMs !== undefined ? AbortSignal.timeout(opts.timeoutMs) : undefined,
     });
   } catch (cause) {
     throw new MetaApiError("No se pudo contactar la API de Meta", {
       status: 0,
       details: cause,
+      network: networkPhaseOf(cause),
     });
   }
 
@@ -74,11 +115,15 @@ export async function graphRequest<T>(
   }
 
   if (!res.ok) {
-    const err = (json as { error?: { message?: string; code?: number; type?: string } })
-      ?.error;
+    const err = (
+      json as {
+        error?: { message?: string; code?: number; error_subcode?: number; type?: string };
+      }
+    )?.error;
     throw new MetaApiError(err?.message ?? `Meta respondió ${res.status}`, {
       status: res.status,
       code: err?.code ?? null,
+      subcode: err?.error_subcode ?? null,
       type: err?.type ?? null,
       details: json ?? text,
     });

@@ -1,14 +1,16 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
   CheckCheck,
+  CircleHelp,
   Clock3,
   FileText,
   MapPin,
   Paperclip,
+  RotateCw,
   Smartphone,
   Sparkles,
   UserRound,
@@ -19,7 +21,14 @@ import { formatBytes, mediaLabel } from "./helpers";
 
 function StatusTicks({ status }: { status: MessageDto["status"] }) {
   const cls = "h-[13px] w-[13px]";
-  if (status === "pending") return <Clock3 className={cn(cls, "text-text-4")} strokeWidth={1.7} />;
+  // 024: en camino (aún sin aceptar por Meta) → reloj; reintentando → flecha
+  // circular; sin confirmar → interrogación. `failed` es el triángulo de siempre.
+  if (status === "pending" || status === "queued" || status === "sending")
+    return <Clock3 className={cn(cls, "text-text-4")} strokeWidth={1.7} />;
+  if (status === "retrying")
+    return <RotateCw className={cn(cls, "text-warning-text")} strokeWidth={1.7} />;
+  if (status === "delivery_unknown")
+    return <CircleHelp className={cn(cls, "text-warning-text")} strokeWidth={1.7} />;
   if (status === "sent") return <Check className={cn(cls, "text-text-4")} strokeWidth={1.7} />;
   if (status === "delivered")
     return <CheckCheck className={cn(cls, "text-text-4")} strokeWidth={1.7} />;
@@ -185,7 +194,45 @@ function bubbleTime(iso: string): string {
   });
 }
 
-export function MessageThread({ messages }: { messages: MessageDto[] }) {
+/** 024 — Reenviar el MISMO payload de un mensaje sin entregar (un intento). */
+function ResendButton({
+  messageId,
+  onResend,
+}: {
+  messageId: string;
+  onResend: (messageId: string) => Promise<string | null>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  return (
+    <span className="mt-1 flex flex-wrap items-center gap-2">
+      <button
+        type="button"
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          setProblem(null);
+          const err = await onResend(messageId);
+          setBusy(false);
+          setProblem(err);
+        }}
+        className="rounded-md border border-border-strong bg-background px-2 py-0.5 text-[11.5px] font-medium text-text-1 hover:bg-muted disabled:opacity-60"
+      >
+        {busy ? "Reenviando…" : "Reenviar"}
+      </button>
+      {problem && <span className="text-[11px] text-danger-text">{problem}</span>}
+    </span>
+  );
+}
+
+export function MessageThread({
+  messages,
+  onResend,
+}: {
+  messages: MessageDto[];
+  /** Devuelve un mensaje de error, o null si el reenvío salió bien. */
+  onResend?: (messageId: string) => Promise<string | null>;
+}) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -301,18 +348,47 @@ export function MessageThread({ messages }: { messages: MessageDto[] }) {
                   </span>
                   {out && <StatusTicks status={m.status} />}
                 </span>
+                {out && m.status === "retrying" && (
+                  // 024: fallo recuperable. La burbuja es la MISMA: si el
+                  // siguiente intento acepta, queda como enviada sin más.
+                  <p className="mt-1.5 flex items-start gap-1.5 rounded-md border border-warning-soft bg-warning-tint px-2 py-1.5 text-[11.5px] leading-snug text-warning-text">
+                    <RotateCw className="mt-[1px] h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+                    <span>
+                      <span className="font-semibold">Reintentando…</span>{" "}
+                      {m.error ?? "Meta no respondió."} Se reenviará solo, tal cual.
+                    </span>
+                  </p>
+                )}
+                {out && m.status === "delivery_unknown" && (
+                  // 024: resultado ambiguo. NO se reenvía solo (podría duplicarse).
+                  <p className="mt-1.5 rounded-md border border-warning-soft bg-warning-tint px-2 py-1.5 text-[11.5px] leading-snug text-warning-text">
+                    <span className="flex items-start gap-1.5">
+                      <CircleHelp className="mt-[1px] h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+                      <span>
+                        <span className="font-semibold">Sin confirmar.</span>{" "}
+                        {m.error ?? "No sabemos si llegó."}
+                      </span>
+                    </span>
+                    {onResend && !m.media && <ResendButton messageId={m.id} onResend={onResend} />}
+                  </p>
+                )}
                 {out && m.status === "failed" && (
                   // El triángulo solo decía "algo falló". El motivo lo manda
                   // Meta y lo guardábamos sin enseñarlo nunca.
-                  <p className="mt-1.5 flex items-start gap-1.5 rounded-md border border-danger-soft bg-danger-tint px-2 py-1.5 text-[11.5px] leading-snug text-danger-text">
-                    <AlertTriangle
-                      className="mt-[1px] h-3.5 w-3.5 shrink-0"
-                      strokeWidth={1.8}
-                    />
-                    <span>
-                      <span className="font-semibold">No se entregó.</span>{" "}
-                      {m.error ?? "Meta no informó el motivo."}
+                  <p className="mt-1.5 rounded-md border border-danger-soft bg-danger-tint px-2 py-1.5 text-[11.5px] leading-snug text-danger-text">
+                    <span className="flex items-start gap-1.5">
+                      <AlertTriangle
+                        className="mt-[1px] h-3.5 w-3.5 shrink-0"
+                        strokeWidth={1.8}
+                      />
+                      <span>
+                        <span className="font-semibold">No se entregó.</span>{" "}
+                        {m.error ?? "Meta no informó el motivo."}
+                      </span>
                     </span>
+                    {onResend && m.type === "text" && !m.media && (
+                      <ResendButton messageId={m.id} onResend={onResend} />
+                    )}
                   </p>
                 )}
               </div>

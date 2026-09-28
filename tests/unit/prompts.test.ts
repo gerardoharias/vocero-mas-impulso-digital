@@ -39,7 +39,6 @@ describe("buildAgentSystemPrompt — agenda (015)", () => {
       kb: [],
       stages: [],
       agenda: true,
-      offers: [],
     });
     expect(prompt).toContain("offer_slots");
     expect(prompt).not.toContain("→ startUtc:");
@@ -242,18 +241,72 @@ describe("HORARIO DE ATENCIÓN — el modelo deja de inferirlo de una muestra", 
     expect(prompt).not.toContain("HORARIO DE ATENCIÓN");
   });
 
-  it("la regla de pedir OTRO DÍA existe y nombra el campo", () => {
-    // Si alguien la borra, el modelo vuelve a llamar offer_slots a secas y el
-    // cliente recibe otra vez los mismos horarios.
+  it("pedir un día concreto manda a check_availability, no a otra ronda de oferta", () => {
+    // Si alguien borra esta regla, el modelo vuelve a llamar offer_slots a
+    // secas y el cliente recibe otra vez los mismos horarios (incidente
+    // 2026-09-20). Desde las specs 025/026 el camino es check_availability.
     const prompt = buildAgentSystemPrompt({
       profile,
       kb: [],
       stages: [{ name: "Nuevo" }],
       agenda: true,
     });
-    expect(prompt).toContain("`day`");
-    expect(prompt).toContain("EXACTAMENTE los mismos horarios");
-    expect(prompt).toContain("NO filtres tú por hora");
+    expect(prompt).toContain("check_availability es OBLIGATORIA");
+    expect(prompt).toContain(
+      "offer_slots SOLO para una solicitud genérica de opciones"
+    );
+    // Y la muestra que ya vio NO es la agenda completa.
+    expect(prompt).toContain("NUNCA deduzcas la disponibilidad de ellos");
+  });
+});
+
+/**
+ * Incidente 2026-09-25 — el agente abrió TRES mensajes seguidos con
+ * "¡Hola! 👋 Soy Tobias…" en mitad de la conversación, y uno de ellos con un
+ * "Con gusto te doy toda la información" que no venía a cuento: el cliente
+ * acababa de decir "El lunes".
+ *
+ * El saludo ya decía "para conversaciones nuevas", pero nada le decía al
+ * modelo si ésta lo era.
+ */
+describe("el saludo es para ABRIR, no para cada mensaje", () => {
+  const conSaludo = {
+    ...profile,
+    greeting: "¡Hola! 👋 Soy Tobias, de Tobaxis.",
+  };
+
+  it("conversación nueva: el saludo configurado viaja al prompt", () => {
+    const prompt = buildAgentSystemPrompt({
+      profile: conSaludo,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+      esNueva: true,
+    });
+    expect(prompt).toContain("¡Hola! 👋 Soy Tobias, de Tobaxis.");
+    expect(prompt).not.toContain("YA VIENE EN CURSO");
+  });
+
+  it("conversación en curso: el saludo NO viaja, y se prohíbe explícitamente", () => {
+    const prompt = buildAgentSystemPrompt({
+      profile: conSaludo,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+      esNueva: false,
+    });
+    expect(prompt).not.toContain("¡Hola! 👋 Soy Tobias, de Tobaxis.");
+    expect(prompt).toContain("YA VIENE EN CURSO");
+    expect(prompt).toContain("no saludes");
+  });
+
+  it("sin el dato, se comporta como antes: el saludo está disponible", () => {
+    // Un llamador que no lo pase (el Laboratorio, /api/bot/*) no debe perder
+    // el saludo por omisión.
+    const prompt = buildAgentSystemPrompt({
+      profile: conSaludo,
+      kb: [],
+      stages: [{ name: "Nuevo" }],
+    });
+    expect(prompt).toContain("¡Hola! 👋 Soy Tobias, de Tobaxis.");
   });
 });
 
@@ -299,7 +352,7 @@ describe("el sesgo a escalar y el objetivo de agendar", () => {
     expect(p).toContain("TU OBJETIVO");
     expect(p).toContain("quede con una cita agendada");
     // Y el puente explícito: dato concreto del cliente → ofrecer horarios.
-    expect(p).toContain("el siguiente paso natural es offer_slots");
+    expect(p).toContain("el siguiente paso natural es ofrecerle horarios");
   });
 
   it("…pero ofrecer no es insistir", () => {

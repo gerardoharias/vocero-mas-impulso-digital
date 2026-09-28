@@ -279,6 +279,32 @@ export function InboxClient({ channels }: { channels: readonly Channel[] }) {
   }, [messages, pending, selectedId]);
 
   /**
+   * 024 — Reenvío manual de un mensaje sin entregar: el MISMO payload, la MISMA
+   * burbuja. Devuelve el motivo si falla (lo pinta el botón), null si salió.
+   */
+  const resendMessage = useCallback(
+    async (messageId: string): Promise<string | null> => {
+      const conversationId = selectedIdRef.current;
+      if (!conversationId) return "Sin conversación seleccionada";
+      const res = await fetch(
+        `/api/conversations/${conversationId}/messages/${messageId}/resend`,
+        { method: "POST" }
+      ).catch(() => null);
+      if (!res) return "Sin conexión con el servidor";
+      if (!res.ok) {
+        const data = (await res.json().catch(() => null)) as {
+          error?: { message?: string };
+        } | null;
+        return data?.error?.message ?? "No se pudo reenviar el mensaje";
+      }
+      await refetchMessages(conversationId);
+      return null;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  /**
    * El compositor NO espera a que esto termine: limpia su campo al instante y
    * aquí se pinta la burbuja "enviando". Si el envío falla, la burbuja se
    * retira y el error vuelve al compositor, que devuelve el texto — un mensaje
@@ -423,7 +449,7 @@ export function InboxClient({ channels }: { channels: readonly Channel[] }) {
                 </button>
               )}
             </header>
-            <MessageThread messages={thread} />
+            <MessageThread messages={thread} onResend={resendMessage} />
             <Composer
               conversation={selected}
               onSend={sendText}

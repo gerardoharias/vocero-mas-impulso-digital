@@ -1,7 +1,12 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { newId } from "@/lib/db/ids";
-import { graphRequest, MetaApiError, normalizeRecipient } from "@/lib/meta/client";
+import {
+  graphRequest,
+  MetaApiError,
+  normalizeRecipient,
+  type NetworkPhase,
+} from "@/lib/meta/client";
 import { describeSendError } from "@/lib/meta/send-errors";
 import { publish } from "@/server/events/bus";
 import {
@@ -36,6 +41,29 @@ import {
   uploadGraphMedia,
   validateOutgoing,
 } from "@/server/whatsapp/media";
+import { ATTEMPT_TIMEOUT_MS } from "@/server/outbox/policy";
+import {
+  attemptDelivery,
+  enqueueText,
+  type DeliveryOutcome,
+} from "@/server/outbox";
+import type { OfferedSlot } from "@/server/agenda/offers";
+import { blockReasonForManualResend } from "@/server/agenda/offer-resend-guard";
+import { staleMessage } from "@/server/agenda/offer-freshness";
+
+/**
+ * 024 — Lo que se sabe del fallo de transporte, saneado (sin cuerpos de Meta,
+ * sin destinatario). Es la entrada de la política de reintentos
+ * (`server/outbox/policy.ts`), que decide por código + etapa, no por texto.
+ */
+export type TransportFailure = {
+  httpStatus: number | null;
+  code: number | null;
+  subcode: number | null;
+  network: NetworkPhase | null;
+  /** 200 sin `messages[0].id`: Meta pudo haber aceptado el mensaje. */
+  noMessageId?: boolean;
+};
 
 /** Error tipado del envío; `code` mapea a HTTP en la capa de API. */
 export class SendError extends Error {
@@ -46,9 +74,15 @@ export class SendError extends Error {
     | "window_closed"
     | "meta_error"
     | "meta_unavailable"
-    | "upload_failed";
+    | "upload_failed"
+    /** 024: la oferta de horarios ya no es vigente; no se envía. */
+    | "offer_stale"
+    /** 024: otro operador/trabajador ya reenvió o está reenviando este mensaje. */
+    | "resend_conflict";
   /** 008: presente cuando el fallo ocurrió TRAS persistir el mensaje (failed). */
   messageId?: string;
+  /** 024: detalle saneado del fallo de transporte (sólo canal WhatsApp). */
+  transport?: TransportFailure;
 
   constructor(code: SendError["code"], message: string) {
     super(message);
@@ -57,9 +91,16 @@ export class SendError extends Error {
   }
 }
 
-type SendResult = { messageId: string };
+type SendResult = {
+  messageId: string;
+  /**
+   * 024: estado del mensaje al volver. Un fallo recuperable NO lanza: el
+   * mensaje ya existe (`retrying`) y el outbox lo reintenta íntegro.
+   */
+  status?: string;
+};
 
-type SendTarget = {
+export type SendTarget = {
   conversation: typeof schema.conversation.$inferSelect;
   /** null cuando el destino no es WhatsApp (014). */
   credentials: Credentials | null;
@@ -75,7 +116,7 @@ type SendTarget = {
  * tenant, sandbox del Laboratorio (ASERCIÓN DURA, FR-031: jamás toca la API
  * real), ventana de 24 h, credenciales y destinatario.
  */
-async function prepareSend(
+export async function prepareSend(
   conversationId: string,
   organizationId: string
 ): Promise<SendTarget> {
@@ -285,54 +326,69 @@ const SILENT_FAILURE_CODES = new Set<SendError["code"]>([
   "window_closed",
 ]);
 
-/** Envía un mensaje de texto libre por WhatsApp. */
+/**
+ * 024 — Entrega UN texto por el transporte del canal de la conversación. Es lo
+ * único que un intento del outbox ejecuta: recibe el texto YA persistido, no
+ * decide nada ni reconstruye nada.
+ */
+export async function deliverText(
+  target: SendTarget,
+  text: string
+): Promise<string> {
+  if (target.instagram) return callInstagramSend(target, text);
+  if (target.messenger) return callMessengerSend(target, text);
+  return callGraphSend(target.credentials!, {
+    messaging_product: "whatsapp",
+    to: target.recipient,
+    type: "text",
+    text: { body: text },
+  });
+}
+
+/** Traduce el desenlace de un intento al contrato histórico de `sendText`. */
+function resultOf(outcome: DeliveryOutcome): SendResult {
+  if (!outcome.claimed) {
+    throw new SendError("resend_conflict", "El mensaje ya se está reenviando");
+  }
+  if (outcome.outcome === "failed") {
+    const err = outcome.sendError;
+    err.messageId = outcome.messageId;
+    throw err;
+  }
+  return { messageId: outcome.messageId, status: outcome.outcome };
+}
+
+/**
+ * Envía un mensaje de texto libre.
+ *
+ * 024 — El payload final se PERSISTE antes del primer intento (`queued`) y cada
+ * intento —éste y los reintentos del trabajador— lee ese texto de la base:
+ * nadie lo reconstruye. Un fallo recuperable no lanza (queda `retrying`); uno
+ * ambiguo tampoco (`delivery_unknown`); uno definitivo sí lanza `SendError`, con
+ * `messageId`, como siempre.
+ */
 export async function sendText(input: {
   conversationId: string;
   organizationId: string;
   text: string;
   aiGenerated?: boolean;
+  /** 024: una respuesta lógica por clave (p. ej. `agent-turn:<inbound>`). */
+  dedupeKey?: string;
+  /** 024: horarios que este mensaje muestra; se activan cuando Meta lo acepta. */
+  offers?: OfferedSlot[];
 }): Promise<SendResult> {
+  let target: SendTarget;
   try {
-    const target = await prepareSend(input.conversationId, input.organizationId);
-    const { credentials, recipient } = target;
-
-    const waMessageId = target.instagram
-      ? await callInstagramSend(target, input.text)
-      : target.messenger
-        ? await callMessengerSend(target, input.text)
-        : await callGraphSend(credentials!, {
-            messaging_product: "whatsapp",
-            to: recipient,
-            type: "text",
-            text: { body: input.text },
-          });
-
-    const messageId = await persistOutbound({
-      organizationId: input.organizationId,
-      conversationId: input.conversationId,
-      waMessageId,
-      type: "text",
-      text: input.text,
-      // Un canal sin acuses de entrega confirma al aceptar; uno con acuses
-      // avanza despues por webhook. Sin esta distincion el mensaje se queda
-      // con el reloj puesto para siempre.
-      status: capabilitiesFor(target.conversation.channel).deliveryReceipts
-        ? "pending"
-        : "sent",
-      aiGenerated: input.aiGenerated,
-      origin: input.aiGenerated ? "ai" : "operator",
-    });
-
-    return { messageId };
+    target = await prepareSend(input.conversationId, input.organizationId);
   } catch (err) {
     if (err instanceof SendError && SILENT_FAILURE_CODES.has(err.code)) {
       throw err;
     }
-    // Bug reportado: un rechazo SÍNCRONO de Meta (destinatario sin teléfono
-    // ni identidad utilizable, número inexistente, etc.) nunca llegaba a
-    // persistirse — a diferencia de sendMediaMessage, que sí deja un mensaje
-    // "failed" visible. El agente respondía en apariencia y el prospecto no
-    // recibía nada, sin ningún rastro en el hilo ni en el panel.
+    // Bug reportado: un rechazo previo al envío (destinatario sin teléfono ni
+    // identidad utilizable, etc.) nunca llegaba a persistirse — a diferencia de
+    // sendMediaMessage, que sí deja un mensaje "failed" visible. El agente
+    // respondía en apariencia y el prospecto no recibía nada, sin ningún rastro
+    // en el hilo ni en el panel.
     const sendErr =
       err instanceof SendError
         ? err
@@ -360,6 +416,79 @@ export async function sendText(input: {
     }
     throw sendErr;
   }
+
+  const { message, created } = await enqueueText({
+    organizationId: input.organizationId,
+    conversationId: input.conversationId,
+    text: input.text,
+    origin: input.aiGenerated ? "ai" : "operator",
+    aiGenerated: input.aiGenerated ?? false,
+    dedupeKey: input.dedupeKey,
+    offers: input.offers,
+  });
+  // La misma respuesta lógica ya existe: no se vuelve a enviar (G5).
+  if (!created) return { messageId: message.id, status: message.status };
+
+  const outcome = await attemptDelivery(message.id, { target });
+  return resultOf(outcome);
+}
+
+/**
+ * 024 — Reenvío MANUAL de un mensaje `failed` o `delivery_unknown`: mismo
+ * payload, misma burbuja, UN intento. La decisión de asumir el riesgo de
+ * duplicado (si el original sí había llegado) es del operador.
+ */
+export async function resendText(input: {
+  messageId: string;
+  organizationId: string;
+  /** Si viene, el mensaje debe pertenecer a esta conversación. */
+  conversationId?: string;
+}): Promise<SendResult> {
+  const db = getDb();
+  const rows = await db
+    .select({
+      id: schema.message.id,
+      conversationId: schema.message.conversationId,
+      direction: schema.message.direction,
+      type: schema.message.type,
+      status: schema.message.status,
+      text: schema.message.text,
+    })
+    .from(schema.message)
+    .where(
+      and(
+        eq(schema.message.id, input.messageId),
+        eq(schema.message.organizationId, input.organizationId)
+      )
+    )
+    .limit(1);
+  const m = rows[0];
+  if (
+    !m ||
+    m.direction !== "out" ||
+    (input.conversationId && m.conversationId !== input.conversationId)
+  ) {
+    throw new SendError("meta_error", "Mensaje no encontrado");
+  }
+  if (m.type !== "text" || !m.text) {
+    throw new SendError(
+      "meta_error",
+      "Sólo se pueden reenviar mensajes de texto; vuelve a enviar el adjunto"
+    );
+  }
+  if (m.status !== "failed" && m.status !== "delivery_unknown") {
+    // Otro operador ya lo reenvió (o va en camino): no se duplica.
+    throw new SendError("resend_conflict", "Este mensaje no necesita reenvío");
+  }
+  // Una oferta de horarios sólo se reenvía si sigue siendo la vigente y sus
+  // horarios siguen libres. Si no, NO sale nada (ni parcial): hay que generar
+  // una ronda nueva con disponibilidad actualizada.
+  const blocked = await blockReasonForManualResend(m.id);
+  if (blocked) throw new SendError("offer_stale", staleMessage(blocked));
+
+  const target = await prepareSend(m.conversationId, input.organizationId);
+  const outcome = await attemptDelivery(m.id, { target, manual: true });
+  return resultOf(outcome);
 }
 
 /**
@@ -559,27 +688,54 @@ export async function callGraphSend(
   try {
     const res = await graphRequest<{ messages?: { id: string }[] }>(
       `${credentials.phoneNumberId}/messages`,
-      { method: "POST", token: credentials.token, body: payload }
+      {
+        method: "POST",
+        token: credentials.token,
+        body: payload,
+        // 024: sin tope, un Meta colgado bloqueaba el turno. Vencido = ambiguo.
+        timeoutMs: ATTEMPT_TIMEOUT_MS,
+      }
     );
     const id = res.messages?.[0]?.id;
-    if (!id) throw new SendError("meta_error", "Meta no devolvió ID de mensaje");
+    if (!id) {
+      // 200 sin id: Meta pudo haberlo aceptado. La política lo trata como
+      // ambiguo (jamás como rechazo seguro).
+      const missing = new SendError("meta_error", "Meta no devolvió ID de mensaje");
+      missing.transport = {
+        httpStatus: 200,
+        code: null,
+        subcode: null,
+        network: null,
+        noMessageId: true,
+      };
+      throw missing;
+    }
     return id;
   } catch (err) {
     if (err instanceof MetaApiError) {
+      const transport: TransportFailure = {
+        httpStatus: err.status,
+        code: err.code,
+        subcode: err.subcode,
+        network: err.network,
+      };
+      let sendErr: SendError;
       if (err.isAuthError) {
         await markReconnectRequired(credentials.organizationId);
-        throw new SendError(
+        sendErr = new SendError(
           "reconnect_required",
           "El token de WhatsApp expiró: reconecta el número en Configuración"
         );
+      } else if (err.status === 0 || err.status >= 500) {
+        sendErr = new SendError("meta_unavailable", "Meta no está disponible ahora");
+      } else {
+        // Mismo traductor que ya usa el fallo ASÍNCRONO (status.ts): un rechazo
+        // síncrono con el mismo código (p. ej. 131026) debe leerse igual de
+        // claro, no como la jerga cruda de Meta.
+        sendErr = new SendError("meta_error", describeSendError(err.code, err.message));
       }
-      if (err.status === 0 || err.status >= 500) {
-        throw new SendError("meta_unavailable", "Meta no está disponible ahora");
-      }
-      // Mismo traductor que ya usa el fallo ASÍNCRONO (status.ts): un rechazo
-      // síncrono con el mismo código (p. ej. 131026) debe leerse igual de
-      // claro, no como la jerga cruda de Meta.
-      throw new SendError("meta_error", describeSendError(err.code, err.message));
+      sendErr.transport = transport;
+      throw sendErr;
     }
     throw err;
   }

@@ -6,9 +6,21 @@
 sin él, agente/Laboratorio deshabilitados con estado vacío), `OPENROUTER_BASE_URL`
 (default `https://openrouter.ai/api`), `OPENROUTER_MODEL`, `OPENROUTER_JUDGE_MODEL`
 (default = `OPENROUTER_MODEL`). API: `chatJson<T>(schema, messages, opts)` → parsea con
-extracción robusta (bloque ```json, primer `{...}` balanceado), valida con Zod,
-reintenta ante fallo de red/parseo/validación (2 reintentos, backoff corto). Un hipo del
-proveedor NUNCA propaga excepción al turno: agota reintentos → resultado `error` tipado.
+extracción robusta (bloque ```json, primer `{...}`), valida con Zod. **Actualizado por
+[023](../../023-respuesta-estructurada-agente/spec.md)**: pide JSON con `response_format`
+(`json_schema` estricto → `json_object` → sin formato, según `AI_RESPONSE_FORMAT`), el
+esquema JSON se deriva del Zod, y los reintentos dependen de la CLASE de error (429
+respeta `Retry-After`; 5xx/red ≤ 2; timeout ≤ 1; formato/esquema ≤ 1 corrección; 4xx
+determinista 0). **Presupuesto compartido por turno: ≤ 3 llamadas** (reintentos, bajada de
+formato, corrección y recuperación de texto plano descuentan del mismo `CallBudget`); sólo
+formato ≤ 2. Sólo un rechazo EXPLÍCITO del proveedor (`param`/`code` estructurados o la
+frase de OpenRouter para `require_parameters`) baja de `response_format`; un 400/404/422
+genérico es `invalid_request`. Un hipo del proveedor NUNCA propaga excepción al turno: el
+resultado `error` lleva un código explícito (`not_configured`, `unauthorized`,
+`unsupported_response_format`, `schema_rejected`, `model_not_found`, `invalid_request`,
+`rate_limited`, `timeout`, `network_error`, `provider_error`, `invalid_json`,
+`invalid_schema`) y un `detail` fijo, sin contenido del cliente ni del modelo. El modelo
+efectivo sale de `resolveEffectiveModel` (`GET /api/settings/ai` → `effective`).
 
 ## Acción del agente (una por turno)
 
@@ -60,13 +72,13 @@ const AgentAction = z.discriminatedUnion('action', [
   agendada. Un dato concreto del cliente (su sistema, su giro, su problema) es
   la señal de avanzar a `offer_slots`. Con el contrapeso explícito de que
   ofrecer no es insistir.
-- `offer_slots` acepta un `day` opcional (YYYY-MM-DD): con él el motor devuelve
-  varias HORAS de ese día (`pickWithinDay`), sin él el menú normal de varios
-  días (`pickAcrossDays`). Sin ese campo, un cliente que pedía otro día recibía
-  EXACTAMENTE los mismos horarios. El día que no dé nada responde
-  `day_unavailable` con la fecha real y la alternativa más cercana — nunca
-  escala. El esquema no valida el formato: `resolveRequestedDay` ignora lo que
-  no sea una fecha y ofrece el menú normal.
+- `offer_slots` es SOLO para una petición genérica de opciones. En cuanto el
+  cliente nombra un día, una fecha, una hora o un rango, la acción es
+  `check_availability`, que consulta la agenda COMPLETA con las palabras del
+  cliente (`server/agenda/availability-query.ts`) en vez de fiarse de que el
+  modelo calcule la fecha. Lo que no se entiende se pregunta
+  (`availability_clarify`); tres aclaraciones seguidas sin resolver escalan
+  como `agenda_ambigua`.
 - El prompt lleva el HORARIO DE ATENCIÓN configurado y la fecha de hoy. Sin
   eso, el modelo dedujo una restricción inexistente ("solo atendemos por la
   mañana") de una muestra de tres huecos.
@@ -97,6 +109,17 @@ const AgentAction = z.discriminatedUnion('action', [
   cerrada está prohibido el texto libre—, ni en `reprogramacion` (tiene el
   suyo), ni en `manual_reply`/`hostilidad`. El aviso sale UNA sola vez: si la
   conversación ya estaba escalada, no se repite.
+- Ventana cerrada → handoff automático `ventana`. Fallo persistente del proveedor o de
+  configuración (transporte/config) → handoff `error`, sin enviar texto libre. Un fallo de
+  **formato** (texto plano, JSON inválido) NO es un fallo del proveedor: el texto plano
+  seguro se recupera como `reply` (023 §3.4), y si no, se envía un mensaje fijo de
+  degradación (`AI_FALLBACK_MESSAGE`) con la IA activa; dos turnos consecutivos así
+  (`conversation.ai_fail_count ≥ 2`, contador técnico atómico en la base, independiente del
+  texto visible) → handoff `error`. El texto plano JAMÁS ejecuta una acción con efectos.
+- Circuito de protección por organización+modelo: con una falla global (config o
+  transporte agotado, ≥ 2 conversaciones distintas) los turnos no llaman al proveedor ni
+  hacen handoff; la IA sigue activa y el cliente recibe una vez el mensaje fijo (sin
+  prometer un humano). Señal: logs `circuit_open|blocked|closed` sin contenido.
 
 ## Juez del Laboratorio (una llamada por conversación)
 

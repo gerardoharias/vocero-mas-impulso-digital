@@ -1,30 +1,26 @@
 import { appBaseUrl } from "@/lib/env";
 import { computeAvailability } from "@/server/agenda/availability";
-import {
-  getSettings,
-  type CalendarSettings,
-} from "@/server/agenda/settings";
+import { getSettings } from "@/server/agenda/settings";
 import { renderWeeklyHours, type BusinessHours } from "@/server/agenda/hours";
+import { pickAcrossDays, spreadByDay } from "@/server/agenda/spread";
+import type { OfferedSlot } from "@/server/agenda/offers";
 import {
-  pickAcrossDays,
-  pickWithinDay,
-  slotsOnDay,
-  spreadByDay,
-  type SpreadSlot,
-} from "@/server/agenda/spread";
-import { getOffers, replaceOffers } from "@/server/agenda/offers";
+  queryAvailability,
+  type AvailabilityMeta,
+  type AvailabilityQuery,
+} from "@/server/agenda/availability-query";
+import type {
+  AgendaClarifyContext,
+  AgendaClarifyReason,
+  WeekQualifier,
+} from "@/server/agenda/agenda-clarify-context";
 import {
   BookingError,
   createSessionBooking,
   findActiveBooking,
   listActiveBookings,
 } from "@/server/agenda/service";
-import {
-  addDaysISO,
-  dayLabelInTz,
-  labelInTz,
-  todayInTz,
-} from "@/lib/time/slots";
+import { labelInTz } from "@/lib/time/slots";
 import { requestReschedule } from "@/server/agenda/reschedule-requests";
 
 /**
@@ -133,6 +129,10 @@ export type AgendaTurnStatus =
   | "reschedule_pending"
   | "slot_taken"
   | "not_offered"
+  /** 025 — respuesta a una consulta directa de disponibilidad. */
+  | "availability"
+  /** 025 — la consulta no se pudo interpretar: se pregunta, no se afirma nada. */
+  | "availability_clarify"
   | "error";
 
 export type AgendaTurn = {
@@ -141,57 +141,31 @@ export type AgendaTurn = {
   /** false ⇒ el motor no pudo; el turno sigue, sin agendar. */
   ok: boolean;
   status: AgendaTurnStatus;
+  /**
+   * 024 — Los horarios REGISTRABLES que este texto muestra (el catálogo, más
+   * ancho que el menú). NO se escriben aquí: quien envía el mensaje los
+   * persiste junto con él y quedan `pending` hasta que Meta lo acepta, porque
+   * un horario "ofrecido" que el prospecto nunca vio no es seleccionable.
+   */
+  offers?: OfferedSlot[];
+  /**
+   * 025 — ¿La lista que se le mostró al prospecto es parcial o completa?
+   * (`exhaustive`, `hasMore`, `total`…). Nadie debe deducir «no hay» de una lista
+   * que declara `hasMore`.
+   */
+  availability?: AvailabilityMeta;
+  /**
+   * 026 — presente SÓLO cuando `status === "availability_clarify"`: por qué
+   * no se pudo resolver y qué se entendió, para que el pipeline decida si
+   * hereda el contexto en el turno siguiente o escala a un humano.
+   */
+  clarify?: { reason: AgendaClarifyReason; context: AgendaClarifyContext | null };
 };
-
-/** Cuántos huecos del día pedido se registran como reservables. */
-const DAY_OFFERED = 8;
-/** Techo del catálogo persistido: varias rondas de "¿y el jueves?" no deben engordarlo sin fin. */
-const OFFERS_CAP = 20;
-
-type DayResolution =
-  | { kind: "ok"; dayIso: string }
-  | { kind: "out_of_window" }
-  | { kind: "ignore" };
-
-/**
- * Qué hacer con el `day` que mandó el modelo.
- *
- * Un día que no parsea se IGNORA (oferta normal) en vez de romper el turno: el
- * cliente recibe opciones, que es mejor que un error. Un día pasado o más allá
- * de `maxDaysAhead` sí se dice — y NO se "repara" buscando el mismo día-mes en
- * el futuro, porque adivinar aquí agenda al cliente en una fecha que no pidió.
- */
-function resolveRequestedDay(
-  day: string | undefined,
-  settings: CalendarSettings,
-  now: Date
-): DayResolution {
-  if (!day) return { kind: "ignore" };
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return { kind: "ignore" };
-  const parsed = new Date(`${day}T12:00:00.000Z`);
-  if (Number.isNaN(parsed.getTime())) return { kind: "ignore" };
-  const today = todayInTz(now, settings.timezone);
-  const last = addDaysISO(today, settings.maxDaysAhead);
-  if (day < today || day > last) return { kind: "out_of_window" };
-  return { kind: "ok", dayIso: day };
-}
-
-function listar(shown: SpreadSlot[], intro: string | undefined): AgendaTurn {
-  const lista = shown.map((s) => `• ${s.dayLabel} a las ${s.time}`).join("\n");
-  const cabecera = intro?.trim() || "Tengo estos horarios disponibles:";
-  return { ok: true, status: "offered", text: `${cabecera}\n${lista}` };
-}
 
 export async function offerSlots(input: {
   organizationId: string;
   conversationId: string;
   intro?: string;
-  /**
-   * El día del que el cliente pidió horarios (YYYY-MM-DD, zona del negocio).
-   * Con él se muestran varias HORAS de ESE día; sin él, el menú normal de
-   * varios días. Incidente 2026-09-20.
-   */
-  day?: string;
 }): Promise<AgendaTurn> {
   const settings = await getSettings(input.organizationId);
   const now = new Date();
@@ -199,135 +173,98 @@ export async function offerSlots(input: {
     settings,
     now,
   });
-  // El catálogo ancho se calcula SIEMPRE: es el que conserva los otros días
-  // como alternativas legítimas aunque esta ronda vaya filtrada.
-  const wide = spreadByDay(all, {
+  const spread = spreadByDay(all, {
     timezone: settings.timezone,
     limit: OFFERED,
     perDay: 3,
     now,
   });
 
-  if (wide.length === 0) {
+  if (spread.length === 0) {
     // Agenda llena no es un error: es una respuesta que el cliente entiende.
-    // La intro del modelo se DESCARTA: la escribió dando por hecho que habría
-    // lista debajo, y pegarla sola ("Claro, aquí tienes horarios:") deja al
-    // prospecto mirando una promesa vacía.
     return {
       ok: false,
       status: "no_availability",
+      // La intro del modelo se DESCARTA: la escribió dando por hecho que habría
+      // lista debajo, y pegarla sola ("Claro, aquí tienes horarios:") deja al
+      // prospecto mirando una promesa vacía.
       text: "Por ahora no me quedan horarios libres. Déjame confirmarlo con el equipo y te aviso.",
+      // El horizonte se evaluó COMPLETO y no hay nada: aquí sí es una negación honesta.
+      availability: {
+        kind: "suggestions",
+        scopeComplete: true,
+        exhaustive: true,
+        hasMore: false,
+        total: 0,
+        conveyed: 0,
+      },
     };
   }
 
-  const pedido = resolveRequestedDay(input.day, settings, now);
-
-  if (pedido.kind === "ignore") {
-    await persistOffers(input, wide);
-    // `wide` ya viene agrupado por día en orden cronológico: tomar los
-    // primeros SHOWN a secas mostraría solo el primer día si ese día por sí
-    // solo llena el menú. `pickAcrossDays` reparte por variedad primero.
-    return listar(pickAcrossDays(wide, SHOWN), input.intro);
-  }
-
-  const delDia =
-    pedido.kind === "ok"
-      ? spreadByDay(slotsOnDay(all, pedido.dayIso, settings.timezone), {
-          timezone: settings.timezone,
-          limit: DAY_OFFERED,
-          perDay: DAY_OFFERED,
-          now,
-        })
-      : [];
-
-  if (delDia.length === 0) {
-    return await dayUnavailable(input, pedido, all, wide, settings, now);
-  }
-
-  // Los huecos que el cliente ACABA de ver se van al final: pidió otro horario
-  // justamente porque esos no le servían. Sale del dato que el motor ya tiene
-  // (la oferta vigente), sin pedirle un campo más al modelo.
-  const yaVistos = new Set(
-    (await getOffers(input.organizationId, input.conversationId)).map((o) =>
-      Date.parse(o.startUtc)
-    )
-  );
-  const ordenados = [...delDia].sort(
-    (a, b) =>
-      Number(yaVistos.has(Date.parse(a.startUtc))) -
-      Number(yaVistos.has(Date.parse(b.startUtc)))
-  );
-
-  await persistOffers(input, [...wide, ...delDia]);
-  return listar(pickWithinDay(ordenados, SHOWN), input.intro);
-}
-
-/** Registra el catálogo deduplicado por instante y ordenado, con techo. */
-async function persistOffers(
-  input: { organizationId: string; conversationId: string },
-  slots: SpreadSlot[]
-): Promise<void> {
-  const porInstante = new Map<number, SpreadSlot>();
-  for (const s of slots) porInstante.set(Date.parse(s.startUtc), s);
-  const unicos = [...porInstante.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .slice(0, OFFERS_CAP)
-    .map(([, s]) => ({ startUtc: s.startUtc, label: s.label }));
-  await replaceOffers(input.organizationId, input.conversationId, unicos);
+  // Se REGISTRA todo el catálogo, no solo lo que se enseña: si el cliente pide
+  // otro día, el agente tiene alternativas legítimas que aceptar. (024: el
+  // registro lo hace el envío, ligado al mensaje; aquí sólo se calcula.)
+  // `spread` ya viene agrupado por día en orden cronológico: tomar los
+  // primeros SHOWN a secas mostraría solo el primer día si ese día por sí
+  // solo llena el menú. `pickAcrossDays` reparte por variedad primero.
+  const shown = pickAcrossDays(spread, SHOWN);
+  // `shown` marca lo que el TEXTO enseña: es lo único que se revalida si el
+  // mensaje hay que reenviarlo (spec 024 §5.6).
+  const shownStarts = new Set(shown.map((s) => s.startUtc));
+  const offers = spread.map((s) => ({
+    startUtc: s.startUtc,
+    label: s.label,
+    shown: shownStarts.has(s.startUtc),
+  }));
+  const lista = shown.map((s) => `• ${s.dayLabel} a las ${s.time}`).join("\n");
+  const intro = input.intro?.trim() || "Tengo estos horarios disponibles:";
+  return {
+    ok: true,
+    status: "offered",
+    text: `${intro}\n${lista}`,
+    offers,
+    // Son SUGERENCIAS, no la agenda: `total` es la cuenta completa del horizonte
+    // y `hasMore` avisa que hay más de lo que se enseña (025 §4).
+    availability: {
+      kind: "suggestions",
+      scopeComplete: true,
+      exhaustive: all.length <= shown.length,
+      hasMore: all.length > shown.length,
+      total: all.length,
+      conveyed: shown.length,
+    },
+  };
 }
 
 /**
- * El día pedido no dio nada. Se dice con la fecha real y se ofrece lo más
- * cercano — nunca se escala ni se inventa una restricción de horario, que es
- * justo lo que pasó el 2026-09-20 ("las demostraciones las tenemos en horario
- * de mañana", que no salía de ninguna configuración).
- *
- * La intro del modelo se descarta por el mismo motivo que arriba: la escribió
- * creyendo que habría horarios de ese día.
+ * 025 — Consulta DIRECTA: el prospecto indicó un día, una hora o un rango. La
+ * respuesta sale del motor evaluado sobre todo lo pedido (no de las primeras
+ * opciones mostradas) y NO escribe nada: devuelve el texto y los horarios, que
+ * `sendText` persiste `pending` con el mensaje (024 §5.6).
  */
-async function dayUnavailable(
-  input: { organizationId: string; conversationId: string },
-  pedido: DayResolution,
-  all: Awaited<ReturnType<typeof computeAvailability>>,
-  wide: SpreadSlot[],
-  settings: CalendarSettings,
-  now: Date
-): Promise<AgendaTurn> {
-  const tz = settings.timezone;
-  const alternativaIso =
-    pedido.kind === "ok"
-      ? wide.find((s) => s.dayIso > pedido.dayIso)?.dayIso ?? wide[0]?.dayIso
-      : wide[0]?.dayIso;
-  const alternativa = alternativaIso
-    ? spreadByDay(slotsOnDay(all, alternativaIso, tz), {
-        timezone: tz,
-        limit: DAY_OFFERED,
-        perDay: DAY_OFFERED,
-        now,
-      })
-    : [];
-
-  if (alternativa.length === 0) {
-    return {
-      ok: false,
-      status: "no_availability",
-      text: "Por ahora no me quedan horarios libres. Déjame confirmarlo con el equipo y te aviso.",
-    };
-  }
-
-  const shown = pickWithinDay(alternativa, SHOWN);
-  const lista = shown.map((s) => `• ${s.dayLabel} a las ${s.time}`).join("\n");
-  const cabecera =
-    pedido.kind === "out_of_window"
-      ? `Solo puedo agendar entre hoy y el ${dayLabelInTz(
-          `${addDaysISO(todayInTz(now, tz), settings.maxDaysAhead)}T12:00:00.000Z`,
-          tz,
-          now
-        )}. Lo más cercano que tengo es:`
-      : `Ese día no me queda nada libre. Lo más cercano que tengo es:`;
-
-  await persistOffers(input, [...wide, ...alternativa]);
-  return { ok: false, status: "day_unavailable", text: `${cabecera}\n${lista}` };
+export async function checkAvailability(input: {
+  organizationId: string;
+  conversationId: string;
+  query: AvailabilityQuery;
+  /** 026 — calificador de semana heredado de una aclaración pendiente (regla 10). */
+  impliedWeekModifier?: WeekQualifier;
+  /** 026 — 1 = primera vez que se pregunta esto; ≥2 = ya se preguntó antes. */
+  priorClarifyAttempt?: number;
+}): Promise<AgendaTurn> {
+  const answer = await queryAvailability({
+    organizationId: input.organizationId,
+    query: input.query,
+    impliedWeekModifier: input.impliedWeekModifier,
+    priorClarifyAttempt: input.priorClarifyAttempt,
+  });
+  return {
+    ok: answer.ok,
+    status: answer.status,
+    text: answer.text,
+    offers: answer.offers.length > 0 ? answer.offers : undefined,
+    availability: answer.meta,
+    clarify: answer.clarify,
+  };
 }
 
 export async function bookSlot(input: {
@@ -353,6 +290,9 @@ export async function bookSlot(input: {
       requireOffer: true,
       notes: input.reason?.trim() || null,
       allowAdditional: input.confirmAdditional === true,
+      // 024 §5.7: si el hueco se ocupó, las alternativas NO se registran aquí
+      // como `active`: viajan con el mensaje (`turn.offers`) y quedan `pending`.
+      registerAlternatives: false,
     });
 
     const base =
@@ -417,10 +357,27 @@ export async function bookSlot(input: {
         err.code === "slot_taken"
           ? "Se me acaba de ocupar ese horario, ¡perdón!"
           : "Déjame confirmarte los horarios que tengo:";
+      // Mismo contrato que `offer_slots` (spec 024 §5.6): el mensaje lleva sus
+      // horarios; `shown` marca los que el TEXTO enseña (los primeros SHOWN).
+      const offers = err.slots.map((s, i) => ({
+        startUtc: s.startUtc,
+        label: s.label,
+        shown: i < SHOWN,
+      }));
       return {
         ok: false,
         status: err.code === "slot_taken" ? "slot_taken" : "not_offered",
         text: `${disculpa}\n${lista}`,
+        offers,
+        // Alternativas cercanas: una muestra, no la agenda.
+        availability: {
+          kind: "suggestions",
+          scopeComplete: false,
+          exhaustive: false,
+          hasMore: true,
+          total: err.slots.length,
+          conveyed: Math.min(err.slots.length, SHOWN),
+        },
       };
     }
     return {
