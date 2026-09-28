@@ -61,6 +61,21 @@ Arreglo pendiente, barato: agregar `SOURCE_COMMIT` al entorno del servicio (o
 como build-arg) en EasyPanel; a partir de ahí un `curl` público responde qué
 commit corre, sin credenciales de la plataforma.
 
+**Cómo saber si ya corre el build nuevo, sin credenciales**
+
+Sondear una ruta que SOLO exista en el commit nuevo, sin sesión: **404 = código
+viejo, 401 = ya está arriba** (la ruta existe y pide auth). Se encuentra con
+`git diff --diff-filter=A --name-only <sha_desplegado> HEAD -- 'src/app/api/**/route.ts'`.
+Verificado el 2026-09-28 con `…/messages/[messageId]/resend`.
+
+El deploy tarda ~3-4 min y el corte de servicio es de ~20 s. `listActions`
+(`type: deployment`) pasa de `pending` a `done`; `inspectAppService().commit.sha`
+solo se actualiza al terminar.
+
+**Un healthcheck sano IMPLICA migraciones aplicadas**: el CMD es
+`node migrate.mjs && node server.js`, así que si una migración falla el
+contenedor no levanta. No hay arranque a medias.
+
 **Cómo aplicar**: para "¿está al día producción?", comparar
 `inspectAppService().commit.sha` contra `git rev-parse HEAD` local — hoy es la
 ÚNICA fuente fiable.
