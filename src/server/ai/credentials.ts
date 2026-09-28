@@ -125,14 +125,37 @@ export function tokenLast4(token: string): string {
  */
 export async function resolveAiConfig(
   organizationId: string,
-  opts?: { judge?: boolean; transcribe?: boolean }
+  opts?: { judge?: boolean }
 ): Promise<{ apiToken?: string; model?: string }> {
   const creds = await getAiCredentials(organizationId);
   if (!creds) return {};
-  const model = opts?.judge
-    ? (creds.judgeModel ?? creds.model)
-    : opts?.transcribe
-      ? (creds.transcribeModel ?? creds.model)
-      : creds.model;
+  const model = opts?.judge ? (creds.judgeModel ?? creds.model) : creds.model;
   return { apiToken: creds.token, model };
+}
+
+/**
+ * Config para TRANSCRIBIR notas de voz.
+ *
+ * Devuelve los dos modelos POR SEPARADO a propósito. Resolverlos aquí con un
+ * `transcribeModel ?? model` fue un error real (2026-09-28): la organización
+ * tenía fila con `model = z-ai/glm-5.3-flash` y `transcribe_model` vacío, así
+ * que el modelo del AGENTE ganaba y tapaba `OPENROUTER_TRANSCRIBE_MODEL`, que
+ * estaba bien configurada. El audio seguía muriendo con 404.
+ *
+ * La escalera correcta la aplica `transcribeAudio`, y pone lo DEDICADO
+ * primero venga de donde venga: panel → entorno → modelo del agente. Usar el
+ * modelo del agente para audio casi siempre es lo que NO se quiere.
+ */
+export async function resolveTranscribeConfig(organizationId: string): Promise<{
+  apiToken?: string;
+  transcribeModel?: string;
+  model?: string;
+}> {
+  const creds = await getAiCredentials(organizationId);
+  if (!creds) return {};
+  return {
+    apiToken: creds.token,
+    transcribeModel: creds.transcribeModel ?? undefined,
+    model: creds.model,
+  };
 }

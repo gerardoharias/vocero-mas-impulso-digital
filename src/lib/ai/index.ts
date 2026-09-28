@@ -858,7 +858,7 @@ export async function transcribeAudio(input: {
    * que configuró su token y su modelo en Ajustes → IA seguía transcribiendo
    * con los del entorno.
    */
-  aiConfig?: { apiToken?: string; model?: string };
+  aiConfig?: { apiToken?: string; transcribeModel?: string; model?: string };
 }): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   const orgToken = input.aiConfig?.apiToken?.trim();
   // Mismo criterio que `chatJson`: con token de organización NO se exige el
@@ -867,9 +867,13 @@ export async function transcribeAudio(input: {
     return { ok: false, error: "not_configured" };
   }
   const env = getEnv();
+  // Lo DEDICADO manda, venga del panel o del entorno; el modelo del agente es
+  // el último recurso porque casi nunca acepta audio (ver
+  // `resolveTranscribeConfig`).
   const model =
-    input.aiConfig?.model?.trim() ||
+    input.aiConfig?.transcribeModel?.trim() ||
     env.OPENROUTER_TRANSCRIBE_MODEL ||
+    input.aiConfig?.model?.trim() ||
     env.OPENROUTER_MODEL;
   if (!model?.trim()) return { ok: false, error: "not_configured" };
 
@@ -896,6 +900,9 @@ export async function transcribeAudio(input: {
     ],
     {
       model,
+      // El token de la organización, si lo hay: sin esto la transcripción
+      // usaba SIEMPRE el del entorno, aunque el negocio tuviera el suyo.
+      apiToken: orgToken,
       timeoutMs: 45_000,
       schemaName: "transcripcion",
       correct: { invalidJson: false, invalidSchema: false },

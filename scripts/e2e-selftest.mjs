@@ -2201,7 +2201,11 @@ async function disponibilidadDirectaChecks() {
     const libresL = new Set(lunesL.slots.map((s) => s.time));
     ok(
       "perfil con «Usa offer_slots» + «lunes a las 11 o 12»: se contesta según el motor (no una lista genérica)",
-      ["11:00", "12:00"].every((x) => libresL.has(x) === new RegExp(`libre a las [^.]*${x}|a las ${x} sí tengo`).test(l.body)),
+      ["11:00", "12:00"].every(
+        (x) =>
+          libresL.has(x) ===
+          new RegExp(`libre a las [^.]*${a12(x)}|a las ${a12(x)} sí tengo`).test(l.body)
+      ),
       l.body
     );
     // Lo genérico sigue siendo offer_slots: la regla heredada se aplica donde corresponde.
