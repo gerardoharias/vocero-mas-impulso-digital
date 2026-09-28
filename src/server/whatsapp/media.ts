@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { getEnv } from "@/lib/env";
 import { transcribeAudio } from "@/lib/ai";
-import { resolveAiConfig } from "@/server/ai/credentials";
+import { resolveTranscribeConfig } from "@/server/ai/credentials";
 import { graphRequest, MetaApiError } from "@/lib/meta/client";
 import { publish } from "@/server/events/bus";
 import {
@@ -361,9 +361,7 @@ async function transcribeAndCaption(
   // El modelo de transcripción y el token salen de Ajustes → IA de ESTE
   // negocio; sin fila configurada, `resolveAiConfig` devuelve {} y
   // `transcribeAudio` cae a las variables de entorno.
-  const aiConfig = await resolveAiConfig(organizationId, {
-    transcribe: true,
-  }).catch(() => ({}));
+  const aiConfig = await resolveTranscribeConfig(organizationId).catch(() => ({}));
   const result = await transcribeAudio({ data, mimeType, aiConfig });
   const db = getDb();
 
